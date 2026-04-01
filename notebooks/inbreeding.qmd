@@ -1,0 +1,175 @@
+---
+title: "inbreeding"
+author: "Andrea Estandia"
+date: "31/03/2026"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+# Knitr settings: 
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+options(scipen = 999)
+```
+
+```{r}
+source("./src/wm-europe_source.R")
+```
+
+```{r}
+hom_file <- file.path(reports_path, "roh", "wm_europe_biallelic_filtered_all.hom")
+hom_indiv_file <- file.path(reports_path, "roh", "wm_europe_biallelic_filtered_all.hom.indiv")
+hom_summary_file <- file.path(reports_path, "roh", "wm_europe_biallelic_filtered_all.hom.summary")
+irem_file <- file.path(reports_path, "roh", "wm_europe_biallelic_filtered_all.irem")
+ibc_file <- file.path(reports_path, "roh", "wm_europe_ibc_all.ibc")
+metadata_file <- file.path(data_path, "dfs_processed", "wgs_europe_metadata.csv")
+
+# ---- helpers ----
+clean_names_dt <- function(dt) {
+  setnames(dt, names(dt), tolower(names(dt)))
+  dt
+}
+
+base_theme <- theme_classic(base_size = 14, base_family = "roboto_condensed") +
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_blank(),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 12),
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.tag = element_text(face = "bold", size = 14)
+  )
+
+# ---- read data ----
+# .hom is very large; only read if you need per-segment analyses.
+# hom <- clean_names_dt(fread(hom_file))
+hom_indiv <- clean_names_dt(fread(hom_indiv_file))
+ibc <- clean_names_dt(fread(ibc_file))
+
+# Read only the columns needed for the hotspot plot to keep memory low
+hom_summary <- clean_names_dt(
+  fread(hom_summary_file, select = c("CHR", "BP", "AFF", "UNAFF"))
+)
+
+# Optional metadata join
+metadata <- NULL
+if (file.exists(metadata_file)) {
+  metadata <- read.csv(metadata_file, stringsAsFactors = FALSE)
+  names(metadata) <- tolower(names(metadata))
+}
+
+if (!is.null(metadata) && "iid" %in% names(metadata)) {
+  hom_indiv <- hom_indiv %>% left_join(metadata, by = "iid")
+  ibc <- ibc %>% left_join(metadata, by = "iid")
+}
+
+# ---- quick summaries ----
+roh_indiv_summary <- hom_indiv %>%
+  summarise(
+    n_samples = n(),
+    total_roh_kb = sum(kb, na.rm = TRUE),
+    median_roh_kb = median(kb, na.rm = TRUE),
+    mean_roh_kb = mean(kb, na.rm = TRUE),
+    median_nseg = median(nseg, na.rm = TRUE),
+    mean_nseg = mean(nseg, na.rm = TRUE),
+    median_kbavg = median(kbavg, na.rm = TRUE),
+    mean_kbavg = mean(kbavg, na.rm = TRUE)
+  )
+print(roh_indiv_summary)
+
+write.csv(hom_indiv, file.path(figures_path, "hom_indiv_with_metadata.csv"), row.names = FALSE)
+write.csv(ibc, file.path(figures_path, "ibc_with_metadata.csv"), row.names = FALSE)
+write.csv(roh_indiv_summary, file.path(figures_path, "roh_individual_summary_stats.csv"), row.names = FALSE)
+
+```
+
+
+```{r}
+palette <- c(
+  Spain = "#e76f51",
+  UK = "#34a0a4",
+  Norway = "#ffb703",
+  Shetland = "#6a994e"
+)
+
+remove_ind <- c(
+  "CHA_M66", "MCH_F7", "BNS05", "CHS012", "CMB028", "CMN08",
+  "DUM2", "GUL1", "GUL3", "GUL9", "OSL1", "OSL12", "ROS18", "SP4", "SP5"
+)
+
+ibc_dir <- dirname(ibc_file)
+
+ibc_files <- list(
+  Spain = file.path(ibc_dir, "wm_europe_ibc_spain.ibc"),
+  UK = file.path(ibc_dir, "wm_europe_ibc_uk.ibc"),
+  Norway = file.path(ibc_dir, "wm_europe_ibc_norway.ibc"),
+  Shetland = file.path(ibc_dir, "wm_europe_ibc_shetland.ibc")
+)
+
+# Read data
+ibc_list <- lapply(ibc_files, function(f) {
+  clean_names_dt(fread(f)) %>%
+    rename(sample_name = iid) %>%
+    filter(!sample_name %in% remove_ind) %>%
+    left_join(metadata, by = "sample_name")
+})
+
+# Shared y limits
+ylims <- range(unlist(lapply(ibc_list, \(x) x$fhat2)), na.rm = TRUE)
+ypad <- diff(ylims) * 0.05
+ylims <- c(ylims[1] - ypad, ylims[2] + ypad)
+
+# Shared theme
+base_theme <- theme_classic() +
+  theme(
+    panel.grid = element_blank(),
+    text = element_text(family = "roboto_condensed", size = 16),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+
+make_ibc_plot <- function(df, title) {
+  df %>%
+    mutate(
+      x_id = row_number(),
+      country = title   # 👈 assign country label
+    ) %>%
+    ggplot(aes(x = x_id, y = fhat2, color = country)) +
+    geom_point(size = 1.8) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    coord_cartesian(ylim = ylims) +
+    scale_color_manual(values = palette) +
+    labs(x = NULL, y = "F", title = title) +
+    base_theme +
+    theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      legend.position = "none"   # 👈 cleaner since each panel is one group
+    )
+}
+
+# Individual panels
+p_spain    <- make_ibc_plot(ibc_list[["Spain"]], "Spain")
+p_uk       <- make_ibc_plot(ibc_list[["UK"]], "UK")
+p_norway   <- make_ibc_plot(ibc_list[["Norway"]], "Norway")
+p_shetland <- make_ibc_plot(ibc_list[["Shetland"]], "Shetland")
+
+# Combine
+ibc_plot <- (p_spain + p_uk) /
+            (p_norway + p_shetland) +
+  plot_annotation(tag_levels = "a")
+
+# Save
+ggsave(
+  filename = file.path(figures_path, "ibc_by_subset.png"),
+  plot = ibc_plot,
+  width = 10,
+  height = 8,
+  dpi = 300
+)
+
+ibc_plot
+```

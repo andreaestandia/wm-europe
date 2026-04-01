@@ -1,0 +1,95 @@
+---
+title: "pca"
+author: "Andrea Estandia"
+date: "30/03/2026"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+# Knitr settings: 
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+options(scipen = 999)
+```
+
+```{r}
+source("./src/wm-europe_source.R")
+```
+
+```{r}
+metadata <-  read.csv(
+  file.path(data_path, "dfs_processed", "wgs_europe_metadata.csv"),
+  header = TRUE
+) %>%
+ rename(IID=sample_name)
+```
+
+```{r}
+palette <- c("#e76f51", "#34a0a4", "#ffb703", "#6a994e", "#b08968", "#8ecae6", "#9b2226")
+
+prefixes <- c("fagata", "all", "norway", "shetland", "spain", "uk", "uk_norway_shetland")
+
+plot_pca <- function(prefix) {
+  eigvec_file <- file.path(
+    reports_path, "pca",
+    paste0("wm_europe_biallelic_filtered_pruned_", prefix, ".eigenvec")
+  )
+  eigval_file <- file.path(
+    reports_path, "pca",
+    paste0("wm_europe_biallelic_filtered_pruned_", prefix, ".eigenval")
+  )
+
+  if (!file.exists(eigvec_file) || !file.exists(eigval_file)) {
+    message("Skipping ", prefix, " (missing eigenvec/eigenval)")
+    return(NULL)
+  }
+
+  pca <- read.table(eigvec_file, header = TRUE) %>%
+    left_join(metadata, by = "IID")
+
+  eigenvalues <- read.table(eigval_file, header = FALSE)
+  variance_explained <- (eigenvalues$V1 / sum(eigenvalues$V1)) * 100
+
+  colour_var <- case_when(
+    prefix %in% c("all", "uk_norway_shetland", "fagata") ~ "country",
+    prefix == "uk" ~ "latitude",
+    TRUE ~ "pop"
+  )
+
+  p <- ggplot(pca, aes(x = PC1, y = PC2, color = .data[[colour_var]])) +
+    geom_point(size = 1.5) +
+    theme_classic() +
+    theme(
+      panel.grid = element_blank(),
+      panel.background = element_blank(),
+      text = element_text(family = "roboto_condensed", size = 14),
+      legend.title = element_blank()
+    ) +
+    labs(
+      x = sprintf("\nPC1 (%.1f%%)", variance_explained[1]),
+      y = sprintf("PC2 (%.1f%%)\n", variance_explained[2])
+    )
+
+  # different colour scales depending on variable type
+  if (colour_var == "latitude") {
+    p <- p + scale_color_viridis_c(option = "magma", name = "Latitude")
+  } else {
+    p <- p + scale_color_manual(values = palette)
+  }
+
+  ggsave(
+    filename = file.path(figures_path, paste0("pca_", prefix, ".png")),
+    plot = p,
+    width = 5,
+    height = 4,
+    dpi = 300
+  )
+
+  return(p)
+}
+
+plots <- lapply(prefixes, plot_pca)
+names(plots) <- prefixes
+```

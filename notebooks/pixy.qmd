@@ -1,0 +1,95 @@
+---
+title: "pixy"
+author: "Andrea Estandia"
+date: "01/04/2026"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+# Knitr settings: 
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+options(scipen = 999)
+```
+
+```{r}
+source("./src/wm-europe_source.R")
+```
+
+```{r}
+pixy <- 
+read.table(file.path(reports_path, "pixy", "pixy_dxy.txt"), header = TRUE)
+```
+
+```{r}
+make_pixy_plot <- function(pixy, pop_a, pop_b, min_sites = 100) {
+
+  dat <- pixy %>%
+    filter(pop1 == pop_a, pop2 == pop_b) %>%
+    filter(no_sites >= min_sites) %>%
+    filter(!grepl("scaffold|mito", chromosome)) %>%
+    arrange(chromosome, window_pos_1, window_pos_2)
+
+  dat$n <- seq_len(nrow(dat))
+
+  axisdf <- dat %>%
+    group_by(chromosome) %>%
+    summarize(center = (max(n) + min(n)) / 2, .groups = "drop")
+
+  chrom_levels <- unique(dat$chromosome)
+  dat <- dat %>%
+    mutate(chromosome = factor(chromosome, levels = chrom_levels))
+
+  ggplot(dat, aes(x = n, y = avg_dxy, col = chromosome)) +
+    geom_line() +
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+      text = element_text(family = "roboto_condensed", size = 16),
+      legend.position = "none",
+      plot.title = element_text(face = "bold", hjust = 0.5)
+    ) +
+    scale_x_continuous(
+      breaks = axisdf$center,
+      labels = gsub("chr|scaffold", "", axisdf$chromosome),
+      expand = c(0.01, 0.01)
+    ) +
+    scale_color_manual(values = rep(c("#506485", "#8a94a6"), 26)) +
+    labs(
+      title = paste(pop_a, "vs", pop_b),
+      y = expression(italic(d)[xy]),
+      x = "\n"
+    )
+}
+
+pairs <- list(
+  c("UK", "Shetland"),
+  c("UK", "Norway"),
+  c("UK", "Spain"),
+  c("Shetland", "Norway"),
+  c("Shetland", "Spain"),
+  c("Norway", "Spain")
+)
+
+pixy_plots <- lapply(
+  pairs,
+  function(x) make_pixy_plot(pixy, x[1], x[2], min_sites = 100)
+)
+
+combined_pixy <- wrap_plots(pixy_plots, ncol = 1)
+
+combined_pixy
+
+ggsave(
+  filename = file.path(figures_path, "pixy_dxy_all_pairs.png"),
+  plot = combined_pixy,
+  width = 12,
+  height = 16,
+  dpi = 300
+)
+
+```

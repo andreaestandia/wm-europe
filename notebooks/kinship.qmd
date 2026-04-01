@@ -1,0 +1,231 @@
+---
+title: "kinship"
+author: "Andrea Estandia"
+date: "30/03/2026"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+# Knitr settings: 
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+options(scipen = 999)
+```
+
+```{r}
+source("./src/wm-europe_source.R")
+```
+
+```{r}
+metadata <-  read.csv(
+  file.path(data_path, "dfs_processed", "wgs_europe_metadata.csv"),
+  header = TRUE
+) %>%
+ rename(IID=sample_name)
+```
+
+```{r}
+# =============================================================================
+# Isolation by distance: PI_HAT (IBD) and KING kinship heatmap
+# All PI_HAT values are derived from the full-dataset genome file only,
+# so allele frequencies are always estimated from the complete sample.
+# =============================================================================
+
+# --- Individuals to exclude --------------------------------------------------
+remove_ind <- c(
+  "CHA_M66", "MCH_F7", "BNS05", "CHS012", "CMB028", "CMN08",
+  "DUM2", "GUL1", "GUL3", "GUL9", "OSL1", "OSL12", "ROS18", "SP4", "SP5"
+)
+
+# --- Metadata ----------------------------------------------------------------
+metadata_filt <- metadata %>%
+  filter(!IID %in% remove_ind)
+
+meta1 <- metadata_filt %>% rename_with(~ paste0(.x, "_1"), -IID)
+meta2 <- metadata_filt %>% rename_with(~ paste0(.x, "_2"), -IID)
+
+# =============================================================================
+# IBD (PI_HAT) — full dataset genome file, subsetted after joining
+# Shetland, Spain, and Norway excluded — sample sizes too small for reliable
+# allele frequency estimation, which inflates PI_HAT (use KING kinship instead).
+# =============================================================================
+
+ibd_combined <- read.table(
+  file.path(reports_path, "ibd", "wm_europe_biallelic_filtered_pruned_all.genome"),
+  header = TRUE
+) %>%
+  filter(!IID1 %in% remove_ind, !IID2 %in% remove_ind) %>%
+  mutate(
+    sample_a = pmin(IID1, IID2),
+    sample_b = pmax(IID1, IID2)
+  ) %>%
+  select(sample_a, sample_b, RT, EZ, Z0, Z1, Z2, PI_HAT, PHE, DST, PPC, RATIO) %>%
+  left_join(meta1, by = c("sample_a" = "IID")) %>%
+  left_join(meta2, by = c("sample_b" = "IID")) %>%
+  mutate(
+    distance_km = distHaversine(
+      cbind(longitude_1, latitude_1),
+      cbind(longitude_2, latitude_2)
+    ) / 1000
+  )
+
+ibd_subset_defs <- list(
+  all = function(df) df,
+  uk  = function(df) df %>% filter(country_1 == "UK" & country_2 == "UK")
+)
+
+# Build both datasets first
+df_all <- ibd_subset_defs$all(ibd_combined)
+df_uk  <- ibd_subset_defs$uk(ibd_combined)
+
+get_summary <- function(df) {
+  df %>%
+    filter(!is.na(distance_km), !is.na(PI_HAT)) %>%
+    mutate(bin_start = floor(distance_km / 100) * 100) %>%
+    group_by(bin_start) %>%
+    summarise(
+      mean_pi  = mean(PI_HAT, na.rm = TRUE),
+      n        = n(),
+      se       = sd(PI_HAT, na.rm = TRUE) / sqrt(n),
+      ci_lower = mean_pi - 1.96 * se,
+      ci_upper = mean_pi + 1.96 * se,
+      .groups  = "drop"
+    )
+}
+
+sum_all <- get_summary(df_all)
+sum_uk  <- get_summary(df_uk)
+
+y_min <- min(c(sum_all$ci_lower, sum_uk$ci_lower), na.rm = TRUE)
+y_max <- max(c(sum_all$ci_upper, sum_uk$ci_upper), na.rm = TRUE)
+
+y_limits <- range(
+  c(sum_all$ci_lower, sum_all$ci_upper,
+    sum_uk$ci_lower,  sum_uk$ci_upper),
+  na.rm = TRUE
+)
+
+make_ibd_plot <- function(df, subset_name, title_text) {
+
+  df_plot <- df %>%
+    filter(!is.na(distance_km), !is.na(PI_HAT)) %>%
+    mutate(bin_start = floor(distance_km / 100) * 100) %>%
+    group_by(bin_start) %>%
+    summarise(
+      mean_pi  = mean(PI_HAT, na.rm = TRUE),
+      n        = n(),
+      se       = sd(PI_HAT, na.rm = TRUE) / sqrt(n),
+      ci_lower = mean_pi - 1.96 * se,
+      ci_upper = mean_pi + 1.96 * se,
+      .groups  = "drop"
+    )
+
+  if (nrow(df_plot) == 0) {
+    message("No usable data for IBD subset: ", subset_name)
+    return(NULL)
+  }
+
+  x_max <- max(df_plot$bin_start, na.rm = TRUE)
+
+  p <- ggplot(df_plot, aes(x = bin_start, y = mean_pi)) +
+    geom_point(size = 4) +
+    geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 50) +
+    scale_x_continuous(
+      breaks = seq(0, x_max, by = 100),
+      labels = label_number(accuracy = 1, big.mark = "")
+    ) +
+    scale_y_continuous(limits = y_limits) +
+    theme_classic() +
+    theme(
+      panel.grid       = element_blank(),
+      panel.background = element_blank(),
+      text             = element_text(family = "roboto_condensed", size = 14),
+      plot.title       = element_text(hjust = 0, face = "bold", size = 14)
+    ) +
+    labs(
+      title = title_text,
+      x = "\nDistance (km)",
+      y = "Mean IBD \u00b1 95% CI\n"
+    )
+
+  p
+}
+
+ibd_plots <- list(
+  all = make_ibd_plot(ibd_subset_defs$all(ibd_combined), "all", "All samples"),
+  uk  = make_ibd_plot(ibd_subset_defs$uk(ibd_combined),  "uk",  "UK mainland")
+)
+
+names(ibd_plots) <- names(ibd_subset_defs)
+
+combined_plot <- cowplot::plot_grid(
+  ibd_plots$all,
+  ibd_plots$uk,
+  labels = c("A", "B"),
+  rel_widths = c(1.5, 1)  # A is 1.5× wider than B
+)
+
+ggsave(
+  filename = file.path(figures_path, "ibd_distance_combined.png"),
+  plot     = combined_plot,
+  width    = 16,
+  height   = 5,
+  dpi      = 300
+)
+
+# =============================================================================
+# Kinship (KING) — pairwise heatmap
+# =============================================================================
+
+kinship_raw <- read.table(
+  file.path(reports_path, "kinship", "wm_europe_biallelic_filtered.kin0"),
+  header = TRUE
+) %>%
+  filter(!ID1 %in% remove_ind, !ID2 %in% remove_ind) %>%
+  mutate(KINSHIP = ifelse(KINSHIP < 0, 0, KINSHIP)) 
+
+# Make symmetric: duplicate each pair with IDs swapped so the matrix is full
+kinship_sym <- bind_rows(
+  kinship_raw %>% select(ID1, ID2, KINSHIP),
+  kinship_raw %>% rename(ID1 = ID2, ID2 = ID1) %>% select(ID1, ID2, KINSHIP)
+)
+
+# Order samples by population then ID for readable axis labels
+sample_order <- metadata_filt %>%
+  arrange(country, IID) %>%
+  pull(IID)
+
+kinship_sym <- kinship_sym %>%
+  mutate(
+    ID1 = factor(ID1, levels = sample_order),
+    ID2 = factor(ID2, levels = sample_order)
+  )
+
+p_kinship <- ggplot(kinship_sym, aes(x = ID1, y = ID2, fill = KINSHIP)) +
+  geom_tile() +
+  scale_fill_gradient2(
+    low      = "#4575b4",
+    mid      = "white",
+    high     = "#d73027",
+    midpoint = 0,
+    name     = "Kinship"
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x     = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 5),
+    axis.text.y     = element_text(size = 5),
+    axis.title      = element_blank(),
+    legend.position = "right",
+    text            = element_text(family = "roboto_condensed", size = 14)
+  )
+
+ggsave(
+  filename = file.path(figures_path, "kinship_heatmap.png"),
+  plot     = p_kinship,
+  width    = 10,
+  height   = 9,
+  dpi      = 300
+)
+```

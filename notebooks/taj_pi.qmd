@@ -1,0 +1,138 @@
+---
+title: "taj_pi"
+author: "Andrea Estandia"
+date: "01/04/2026"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+# Knitr settings: 
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+options(scipen = 999)
+```
+
+```{r}
+source("./src/wm-europe_source.R")
+```
+
+```{r}
+make_taj_plot <- function(pop, reports_path) {
+  file_path <- file.path(
+    reports_path,
+    "tajimasD",
+    paste0(pop, "_tajimasD_50kb.Tajima.D")
+  )
+
+  taj <- data.table::fread(file_path, header = TRUE)
+  taj$n <- seq_len(nrow(taj))
+
+  taj <- taj %>%
+    filter(!grepl("scaffold|mito", CHROM))
+
+  chrom_levels <- unique(taj$CHROM)
+
+  axisdf <- taj %>%
+    group_by(CHROM) %>%
+    summarize(center = (max(n) + min(n)) / 2, .groups = "drop")
+
+  taj <- taj %>%
+    mutate(CHROM = factor(CHROM, levels = chrom_levels))
+
+  ggplot(taj %>% filter(N_SNPS > 500), aes(x = n, y = TajimaD, col = CHROM)) +
+    geom_line() +
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+      text = element_text(family = "roboto_condensed", size = 16),
+      legend.position = "none",
+      plot.title = element_text(face = "bold", hjust = 0.5)
+    ) +
+    geom_hline(yintercept = -5 * sd(taj$TajimaD, na.rm = TRUE), linetype = "dashed") +
+    geom_hline(yintercept =  5 * sd(taj$TajimaD, na.rm = TRUE), linetype = "dashed") +
+    scale_x_continuous(
+      breaks = axisdf$center,
+      labels = gsub("chr|scaffold", "", axisdf$CHROM),
+      expand = c(0.01, 0.01)
+    ) +
+    scale_color_manual(values = rep(c("#506485", "#8a94a6"), 26)) +
+    labs(
+      title = pop,
+      y = "Tajima's D\n",
+      x = "\n"
+    )
+}
+
+make_pi_plot <- function(pop, reports_path) {
+  file_path <- file.path(
+    reports_path,
+    "pi",
+    paste0(pop, "_pi_50kb.windowed.pi")
+  )
+
+  pi_dat <- data.table::fread(file_path, header = TRUE)
+
+  # If your pi file uses BIN_START / BIN_END, this gives a midpoint axis
+  pi_dat$n <- seq_len(nrow(pi_dat))
+  pi_dat$mid <- (pi_dat$BIN_START + pi_dat$BIN_END) / 2
+
+  pi_dat <- pi_dat %>%
+    filter(!grepl("scaffold|mito", CHROM))
+
+  chrom_levels <- unique(pi_dat$CHROM)
+
+  axisdf <- pi_dat %>%
+    group_by(CHROM) %>%
+    summarize(center = (max(n) + min(n)) / 2, .groups = "drop")
+
+  pi_dat <- pi_dat %>%
+    mutate(CHROM = factor(CHROM, levels = chrom_levels))
+
+  ggplot(pi_dat %>% filter(N_VARIANTS > 500), aes(x = n, y = PI, col = CHROM)) +
+    geom_line() +
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+      text = element_text(family = "roboto_condensed", size = 16),
+      legend.position = "none",
+      plot.title = element_text(face = "bold", hjust = 0.5)
+    ) +
+    scale_x_continuous(
+      breaks = axisdf$center,
+      labels = gsub("chr|scaffold", "", axisdf$CHROM),
+      expand = c(0.01, 0.01)
+    ) +
+    scale_color_manual(values = rep(c("#506485", "#8a94a6"), 26)) +
+    labs(
+      title = pop,
+      y = "Pi\n",
+      x = "\n"
+    )
+}
+
+pops <- c("norway", "shetland", "spain", "uk")
+
+taj_plots <- lapply(pops, make_taj_plot, reports_path = reports_path)
+pi_plots  <- lapply(pops, make_pi_plot,  reports_path = reports_path)
+
+taj_col <- wrap_plots(taj_plots, ncol = 1)
+pi_col  <- wrap_plots(pi_plots,  ncol = 1)
+
+combined_plot <- taj_col | pi_col
+
+combined_plot
+
+ggsave(
+  filename = file.path(figures_path, "tajimasD_pi_50kb.png"),
+  plot = combined_plot,
+  width = 12,
+  height = 12,
+  dpi = 300
+)
+```

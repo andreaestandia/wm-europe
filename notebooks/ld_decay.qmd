@@ -1,0 +1,70 @@
+---
+title: "ld_decay"
+author: "Andrea Estandia"
+date: "31/03/2026"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+# Knitr settings: 
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+options(scipen = 999)
+```
+
+```{r}
+source("./src/wm-europe_source.R")
+```
+
+```{r}
+make_ld_plot <- function(pop, reports_path, max_distance = 100000) {
+  file_path <- file.path(
+    reports_path,
+    "ld_decay",
+    paste0("wm_europe_biallelic_filtered_", pop, "_lddecay.ld_decay")
+  )
+
+  ld_bins <- read.table(file_path, header = TRUE)
+
+  ggplot(
+    ld_bins %>% filter(distance < max_distance),
+    aes(x = distance, y = avg_R2)
+  ) +
+    geom_line() +
+    theme_minimal() +
+    theme(
+      plot.background = element_rect(fill = "transparent", color = NA),
+      panel.grid = element_blank(),
+      panel.background = element_blank(),
+      axis.line = element_line(colour = "black"),
+      text = element_text(family = "roboto_condensed"),
+      axis.title = element_text(family = "roboto_condensed"),
+      legend.position = "none",
+      plot.title = element_text(face = "bold", hjust = 0.5)
+    ) +
+    labs(
+      title = pop,
+      y = expression(italic(r)^2),
+      x = "\nDistance (bp)"
+    )
+}
+
+pops <- c("norway", "shetland", "spain", "uk")
+
+ld_plots <- lapply(pops, make_ld_plot, reports_path = reports_path)
+
+combined_ld <- wrap_plots(ld_plots, ncol = 1)
+
+combined_ld
+
+ggsave(
+  file.path(figures_path, "wm_europe_ld_decay_all_pops.png"),
+  plot = combined_ld,
+  width = 7,
+  height = 10,
+  dpi = 300,
+  bg = "transparent"
+)
+```

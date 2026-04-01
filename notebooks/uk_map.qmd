@@ -1,0 +1,121 @@
+---
+title: "uk_map"
+author: "Andrea Estandia"
+date: "30/03/2026"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+# Knitr settings: 
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+options(scipen = 999)
+```
+
+```{r}
+source("./src/wm-europe_source.R")
+```
+
+```{r}
+metadata <-  read.csv(
+  file.path(data_path, "dfs_processed", "wgs_europe_metadata.csv"),
+  header = TRUE
+) %>%
+ rename(IID=sample_name)
+```
+
+```{r}
+# PCA map of UK
+# =============================================================================
+p_pca_map_uk <- pca_df %>%
+  filter(country == "UK", latitude < 59) %>%
+  ggplot() +
+  geom_polygon(
+    data = uk_map,
+    aes(x = long, y = lat, group = group),
+    fill = "grey90",
+    color = NA
+  ) +
+  geom_jitter(
+    aes(x = longitude, y = latitude, color = PC1),
+    size = 3,
+    width = 0.1,
+    height = 0.1
+  ) +
+  coord_quickmap() +
+  scale_color_viridis_c(option = "magma") +
+  base_theme +
+  labs(
+    x = "\nLongitude",
+    y = "Latitude\n",
+    color = "PC1"
+  )
+
+# =============================================================================
+# IBD (UK mainland only)
+# =============================================================================
+p_ibd_uk <- ggplot(df_plot, aes(x = bin_start, y = mean_pi)) +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 50) +
+  scale_x_continuous(
+    breaks = seq(0, max(df_plot$bin_start, na.rm = TRUE), by = 100),
+    labels = label_number(accuracy = 1, big.mark = "")
+  ) +
+  coord_cartesian(ylim = range(df_plot$ci_lower, df_plot$ci_upper, na.rm = TRUE)) +
+  base_theme +
+  labs(
+    title = "UK mainland",
+    x = "\nDistance (km)",
+    y = "Mean IBD \u00b1 95% CI\n"
+  )
+
+# =============================================================================
+# PCA scatter plot
+# =============================================================================
+p_pca_scatter <- ggplot(pca_df, aes(x = PC1, y = PC2, color = latitude)) +
+  geom_point(size = 1.5) +
+  scale_color_viridis_c(option = "magma", name = "Latitude") +
+  base_theme +
+  labs(
+    x = sprintf("\nPC1 (%.1f%%)", variance_explained[1]),
+    y = sprintf("PC2 (%.1f%%)\n", variance_explained[2])
+  )
+
+# =============================================================================
+# Latitude vs PC1
+# =============================================================================
+p_lat_pc1 <- ggplot(pca_df, aes(x = latitude, y = PC1)) +
+  geom_point(size = 1.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  base_theme +
+  labs(
+    x = "\nLatitude",
+    y = "PC1\n"
+  )
+
+# =============================================================================
+# Patchwork layout
+# =============================================================================
+final_plot <- (
+  (p_pca_map_uk + p_pca_scatter) /
+  (p_ibd_uk + p_lat_pc1)
+) +
+  plot_layout(
+    widths = c(1, 1),
+    heights = c(1.1, 1)
+  ) +
+  plot_annotation(tag_levels = "a")
+
+ggsave(
+  filename = file.path(figures_path, "four_panel_summary.png"),
+  plot = final_plot,
+  width = 10,
+  height = 10,
+  dpi = 300
+)
+
+final_plot
+
+```
