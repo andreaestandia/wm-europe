@@ -64,3 +64,273 @@ ggsave(
   dpi = 300
 )
 ```
+
+```{r}
+xpehh_path   <- file.path(reports_path, "selection", "xpehh")
+
+pair_dirs <- list.dirs(xpehh_path, recursive = FALSE, full.names = TRUE)
+
+first_or_na <- function(x) {
+  if (length(x) == 0) NA_character_ else x[1]
+}
+
+read_one_out <- function(out_file, chr_name, pair_name) {
+  dt <- fread(out_file)
+  nms <- names(dt)
+
+  pos_col <- first_or_na(nms[grepl("pos|bp|base", nms, ignore.case = TRUE)])
+  if (is.na(pos_col)) pos_col <- nms[2]
+
+  score_col <- first_or_na(nms[grepl("xpehh|xp_ehh|score|stat|value|val", nms, ignore.case = TRUE)])
+  if (is.na(score_col)) score_col <- nms[length(nms)]
+
+  dt <- dt[, .(
+    pair = pair_name,
+    chr  = chr_name,
+    pos  = as.numeric(get(pos_col)),
+    stat = as.numeric(get(score_col))
+  )]
+
+  dt[!is.na(pos) & !is.na(stat)]
+}
+
+plot_pair <- function(pair_dir) {
+  pair_name <- basename(pair_dir)
+  chr_dirs <- list.dirs(pair_dir, recursive = FALSE, full.names = TRUE)
+
+  all_chr <- rbindlist(lapply(chr_dirs, function(chr_dir) {
+    out_file <- list.files(chr_dir, pattern = "\\.xpehh\\.out$", full.names = TRUE)
+    if (length(out_file) == 0) return(NULL)
+
+    chr_name <- basename(chr_dir)
+    read_one_out(out_file[1], chr_name, pair_name)
+  }), fill = TRUE)
+
+  if (nrow(all_chr) == 0) return(NULL)
+
+  # Keep chr1 then chr2 in order
+  all_chr[, chr := factor(chr, levels = c("chr1", "chr2"))]
+  setorder(all_chr, chr, pos)
+
+  # Build a single continuous x axis: chr2 follows chr1
+  chr_info <- all_chr[, .(
+    chr_len = max(pos, na.rm = TRUE)
+  ), by = chr][order(chr)]
+
+  chr_info[, offset := shift(cumsum(chr_len), fill = 0)]
+  chr_info[, center := offset + chr_len / 2]
+
+  all_chr <- merge(all_chr, chr_info[, .(chr, offset)], by = "chr", all.x = TRUE)
+  all_chr[, x_plot := pos + offset]
+
+  # thresholds
+  mu <- mean(all_chr$stat, na.rm = TRUE)
+  sdv <- sd(all_chr$stat, na.rm = TRUE)
+  upper <- mu + 3 * sdv
+  lower <- mu - 3 * sdv
+
+  ggplot(all_chr, aes(x = x_plot, y = stat, col = chr)) +
+    geom_point(size = 0.35, alpha = 0.85) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_hline(yintercept = upper, linetype = "dashed") +
+    geom_hline(yintercept = lower, linetype = "dashed") +
+    scale_color_manual(values = c("chr1" = "#2C3E50", "chr2" = "#95A5A6")) +
+    scale_x_continuous(
+      breaks = chr_info$center,
+      labels = gsub("chr|scaffold", "", chr_info$chr),
+      expand = c(0.01, 0.01)
+    ) +
+    labs(
+      title = paste0(pair_name, " (±3 SD thresholds)"),
+      x = "\nChromosome",
+      y = "XPEHH\n"
+    ) +
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+      text = element_text(family = "roboto_condensed", size = 16),
+      legend.position = "none",
+      plot.title = element_text(face = "bold", hjust = 0.5)
+    )
+}
+
+plots <- lapply(pair_dirs, plot_pair)
+names(plots) <- basename(pair_dirs)
+
+plot_dir <- file.path(figures_path, "xpehh")
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+for (nm in names(plots)) {
+  if (is.null(plots[[nm]])) next
+
+  ggsave(
+    filename = file.path(plot_dir, paste0(nm, "_xpehh_chr1_chr2.png")),
+    plot = plots[[nm]],
+    width = 12,
+    height = 4,
+    dpi = 300
+  )
+}
+
+```
+
+```{r}
+all_data <- rbindlist(lapply(pair_dirs, function(pair_dir) {
+  pair_name <- basename(pair_dir)
+  chr_dirs <- list.dirs(pair_dir, recursive = FALSE, full.names = TRUE)
+
+  rbindlist(lapply(chr_dirs, function(chr_dir) {
+    out_file <- list.files(chr_dir, pattern = "\\.xpehh\\.out$", full.names = TRUE)
+    if (length(out_file) == 0) return(NULL)
+
+    chr_name <- basename(chr_dir)
+    read_one_out(out_file[1], chr_name, pair_name)
+  }), fill = TRUE)
+}), fill = TRUE)
+
+all_data[, c("pop1", "pop2") := tstrsplit(pair, "_vs_")]
+
+all_data[, stat_std := as.numeric(scale(stat)), by = pair]
+
+# all_data already created with:
+# pair, chr, pos, stat
+# and:
+# all_data[, c("pop1", "pop2") := tstrsplit(pair, "_vs_")]
+# all_data[, stat_std := as.numeric(scale(stat)), by = pair]
+
+window_size <- 1e5   # 100 kb
+threshold   <- 2     # after orientation, use positive threshold
+min_pairs   <- 2     # region must appear in at least this many pairwise comparisons
+
+find_common_regions_for_pop <- function(all_data, target_pop,
+                                        window_size = 1e5,
+                                        threshold = 2,
+                                        min_pairs = 2) {
+  dt <- all_data[pop1 == target_pop | pop2 == target_pop]
+  if (nrow(dt) == 0) return(NULL)
+
+  # Orient so positive always means selection in target_pop
+  dt[, sel_stat := fifelse(pop1 == target_pop, stat_std, -stat_std)]
+
+  # Bin into windows
+  dt[, window := floor(pos / window_size)]
+
+  # Summarize by pair/chromosome/window
+  window_stats <- dt[, .(
+    mean_sel = mean(sel_stat, na.rm = TRUE),
+    max_sel  = max(sel_stat, na.rm = TRUE),
+    min_sel  = min(sel_stat, na.rm = TRUE)
+  ), by = .(pair, chr, window)]
+
+  # Keep windows with strong positive signal in target population
+  selected_windows <- window_stats[max_sel >= threshold]
+
+  if (nrow(selected_windows) == 0) return(NULL)
+
+  # Count how many comparisons support each region
+  common_regions <- selected_windows[, .N, by = .(chr, window)]
+  common_regions <- common_regions[N >= min_pairs]
+
+  if (nrow(common_regions) == 0) return(NULL)
+
+  common_regions[, `:=`(
+    pop = target_pop,
+    start = window * window_size,
+    end   = (window + 1) * window_size
+  )]
+
+  # Add supporting pair count and mean signal
+  support <- selected_windows[, .(
+    n_pairs = uniqueN(pair),
+    strongest = max(max_sel, na.rm = TRUE)
+  ), by = .(chr, window)]
+
+  common_regions <- merge(common_regions, support, by = c("chr", "window"), all.x = TRUE)
+  common_regions[order(chr, start)]
+}
+
+# Run for all populations
+pops <- sort(unique(c(all_data$pop1, all_data$pop2)))
+
+regions_by_pop <- lapply(pops, function(p) {
+  find_common_regions_for_pop(
+    all_data = all_data,
+    target_pop = p,
+    window_size = window_size,
+    threshold = threshold,
+    min_pairs = min_pairs
+  )
+})
+
+names(regions_by_pop) <- pops
+
+# Combine into one table
+common_regions_all <- rbindlist(regions_by_pop, fill = TRUE)
+
+common_regions_all
+
+
+# keep only supported windows
+hits <- common_regions_all[n_pairs >= 2][order(pop, chr, start)]
+
+# merge adjacent 100 kb windows into continuous regions
+hits[, gap := start - shift(end, fill = first(start)), by = .(pop, chr)]
+hits[, region_id := cumsum(is.na(gap) | gap > 0), by = .(pop, chr)]
+
+regions <- hits[, .(
+  region_start = min(start),
+  region_end   = max(end),
+  n_windows    = .N,
+  n_pairs_max  = max(n_pairs, na.rm = TRUE),
+  n_pairs_mean = mean(n_pairs, na.rm = TRUE),
+  strongest    = max(strongest, na.rm = TRUE)
+), by = .(pop, chr, region_id)]
+
+regions[, region_size_kb := (region_end - region_start) / 1000]
+regions <- regions[order(pop, chr, region_start)]
+regions
+
+top_regions <- regions[order(pop, -n_pairs_max, -strongest, -region_size_kb)]
+top_regions
+
+summary_by_pop <- regions[, .(
+  n_regions = .N,
+  total_kb  = sum(region_size_kb, na.rm = TRUE),
+  best_chr  = chr[which.max(strongest)],
+  best_start = region_start[which.max(strongest)],
+  best_end   = region_end[which.max(strongest)],
+  best_strongest = max(strongest, na.rm = TRUE)
+), by = pop]
+
+summary_by_pop
+
+top5_by_pop <- regions[, head(.SD[order(-n_pairs_max, -strongest)], 5), by = pop]
+top5_by_pop
+
+filtered_regions <- regions[
+  n_pairs_max >= 3 &          # consistent across all comparisons
+  strongest >= 5 &            # strong signal
+  region_size_kb <= 5000      # <= 5 Mb (important!)
+]
+
+filtered_regions[order(pop, -strongest)]
+
+merge_gap <- 1e6  # 1 Mb gap allowed
+
+setorder(filtered_regions, pop, chr, region_start)
+
+filtered_regions[, gap := region_start - shift(region_end), by = .(pop, chr)]
+filtered_regions[, group := cumsum(is.na(gap) | gap > merge_gap), by = .(pop, chr)]
+
+merged_regions <- filtered_regions[, .(
+  region_start = min(region_start),
+  region_end   = max(region_end),
+  strongest    = max(strongest),
+  n_regions    = .N
+), by = .(pop, chr, group)]
+
+merged_regions[, size_kb := (region_end - region_start)/1000]
+merged_regions[order(pop, chr, region_start)]
+```

@@ -21,10 +21,45 @@ source("./src/wm-europe_source.R")
 ```{r}
 pca <- fread(file.path(reports_path, "local_pca", "1000", "pcoa_coords.tsv"))
 
-umap <- fread(file.path(reports_path, "local_pca", "1000", "umap_coords.tsv")) %>% mutate(n=1:nrow(.))
+axisdf <- pca %>%
+    group_by(landmark) %>%
+    summarize(center = (max(window_id) + min(window_id)) / 2, .groups = "drop")
 
+local_pca <- 
 pca %>% 
-  ggplot(aes(x=window_id, y=PC1)) +
+  ggplot(aes(x=window_id, y=PC1, col=as.factor(landmark))) +
   geom_point() +
-  theme_bw()
+  scale_x_continuous(
+      breaks = axisdf$center,
+      labels = gsub("chr|scaffold", "", axisdf$landmark),
+      expand = c(0.01, 0.01)
+    ) +
+    scale_color_manual(values = rep(c("#2C3E50", "#95A5A6"), 26)) +
+  theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+      text = element_text(family = "roboto_condensed", size = 16),
+      legend.position = "none",
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5) 
+    ) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_hline(yintercept = 4*sd(pca$PC1, na.rm = TRUE), linetype = "dashed") +
+    geom_hline(yintercept = -4*sd(pca$PC1, na.rm = TRUE), linetype = "dashed") +
+    labs(
+      x = "\nChromosome",
+      y = "PC1\n",
+      title = "Local PCA: PC1 values across genomic 1000bp windows",
+      subtitle = "Dashed lines indicate 4 standard deviations from the mean"
+    )
+
+ggsave(
+  local_pca,
+  filename = file.path(figures_path, "local_pca", "local_pca_plot.png"),
+  width = 9,
+  height = 4
+)
+
 ```

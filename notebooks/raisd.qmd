@@ -1,0 +1,111 @@
+---
+title: "raisd"
+author: "Andrea Estandia"
+date: "07/04/2026"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+# Knitr settings: 
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+options(scipen = 999)
+```
+
+```{r}
+source("./src/wm-europe_source.R")
+```
+
+```{r}
+paths <- list.files(
+  file.path(reports_path, "raisd"),
+  pattern = "\\.clean\\.tsv$",
+  full.names = TRUE
+)
+
+df <- rbindlist(lapply(paths, function(p) {
+  fname <- basename(p)
+  
+  pop <- sub("^RAiSD_Report\\.wm_", "", fname)
+  pop <- sub("\\.clean\\.tsv$", "", pop)
+  
+  cbind(
+    pop = pop,
+    fread(p, col.names = c("chr", "position", "mu"))
+  )
+}))
+
+```
+
+```{r}
+
+# order chromosomes once, globally
+chr_levels <- df %>%
+  distinct(chr) %>%
+  mutate(chr_num = as.numeric(str_extract(chr, "\\d+"))) %>%
+  arrange(chr_num, chr) %>%
+  pull(chr)
+
+prep_raisd <- function(dat) {
+  dat <- dat %>%
+    mutate(chr = factor(chr, levels = chr_levels)) %>%
+    group_by(chr) %>%
+    mutate(chr_start = min(position),
+           chr_end   = max(position)) %>%
+    ungroup()
+
+  chr_df <- dat %>%
+    distinct(chr, chr_start, chr_end) %>%
+    arrange(chr) %>%
+    mutate(chr_len = chr_end - chr_start,
+           offset  = lag(cumsum(chr_len + 1), default = 0),
+           center  = offset + chr_len / 2)
+
+  dat %>%
+    left_join(chr_df %>% select(chr, offset), by = "chr") %>%
+    mutate(genome_pos = position - chr_start + offset) %>%
+    list(data = ., axisdf = chr_df)
+}
+
+plot_raisd_pop <- function(dat, pop_name) {
+  prep <- prep_raisd(dat)
+  d <- prep$data
+  axisdf <- prep$axisdf
+
+  ggplot(d, aes(x = genome_pos, y = mu, col = chr)) +
+    geom_point(size = 0.6, alpha = 0.8) +
+    scale_x_continuous(
+      breaks = axisdf$center,
+      labels = gsub("chr", "", axisdf$chr),
+      expand = c(0.01, 0.01)
+    ) +
+    scale_color_manual(values = rep(c("#2C3E50", "#95A5A6"), length.out = nrow(axisdf))) +
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+      text = element_text(family = "roboto_condensed", size = 16),
+      legend.position = "none",
+      plot.title = element_text(face = "bold", hjust = 0.5)
+    ) +
+    labs(
+      x = "\nChromosome",
+      y = "mu\n",
+      title = paste("RAiSD:", pop_name)
+    )
+}
+
+plots <- lapply(split(df, df$pop), function(d) {
+  plot_raisd_pop(d, unique(d$pop))
+})
+
+ggsave(
+  wrap_plots(plots, ncol = 1),
+  filename = file.path(figures_path, "raisd", "raisd_plot.png"),
+  width = 8,
+  height = 12
+)
+```
