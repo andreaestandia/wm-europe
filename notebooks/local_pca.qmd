@@ -1,0 +1,30 @@
+---
+title: "local_pca"
+author: "Andrea Estandia"
+date: "03/04/2026"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+# Knitr settings: 
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+options(scipen = 999)
+```
+
+```{r}
+source("./src/wm-europe_source.R")
+```
+
+```{r}
+pca <- fread(file.path(reports_path, "local_pca", "1000", "pcoa_coords.tsv"))
+
+umap <- fread(file.path(reports_path, "local_pca", "1000", "umap_coords.tsv")) %>% mutate(n=1:nrow(.))
+
+pca %>% 
+  ggplot(aes(x=window_id, y=PC1)) +
+  geom_point() +
+  theme_bw()
+```

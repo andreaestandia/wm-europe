@@ -1,0 +1,63 @@
+
+---
+title: "prep_feems"
+author: "Andrea Estandia"
+date: "07/04/2026"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+# Knitr settings: 
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+options(scipen = 999)
+```
+
+```{r}
+source("./src/wm-europe_source.R")
+```
+
+```{r}
+list_ids <- read.table(
+  file.path(data_path, "genotype_calling", "wm_europe_10k_snps.fam"),
+  header = FALSE
+) %>%
+  dplyr::select(V2) %>%
+  dplyr::rename(IID = V2)
+
+pts <- metadata %>%
+  filter(!is.na(latitude), !is.na(longitude)) %>%
+  filter(IID %in% list_ids$IID) %>%
+  mutate(.ord = match(IID, list_ids$IID)) %>%
+  arrange(.ord) %>%
+  select(-.ord) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326, remove = FALSE)
+
+shp <- st_read("/Volumes/LaCie/resources/grid_100.shp", quiet = TRUE)
+
+st_crs(shp) <- 4326
+
+if (is.na(st_crs(shp))) {
+  stop("The shapefile has no CRS defined. Assign one before continuing.")
+}
+
+pts_proj <- st_transform(pts, st_crs(shp))
+xy <- st_coordinates(pts_proj)
+
+coord_file <- pts_proj %>%
+  st_drop_geometry() %>%
+  mutate(
+    x = xy[, 1],
+    y = xy[, 2]
+  ) %>%
+  select(x, y)
+
+write.table(
+  coord_file,
+  file.path(reports_path, "feems", "input", "feems.coord"),
+  col.names = FALSE,
+  row.names = FALSE
+)
+```

@@ -21,7 +21,9 @@ source("./src/wm-europe_source.R")
 ```{r define-paths}
 # Define color palette for consistency
 admix_colors <- c("#67a0bf", "#d6b951", "#d4795b", 
-                  "#6da567", "#e38f5e", "#b27fb8", "#a68d60")
+                  "#6da567", "#e38f5e", "#b27fb8", 
+                  "#a68d60", "#8e3b3b", "#776da4", 
+                  "#123456", "#111111")
 ```
 
 ```{r load-data}
@@ -41,79 +43,6 @@ ids_admix <- read.table(file.path(reports_path, "admixture",
   select(V2) %>% 
   rename(IID = V2) %>% 
   left_join(metadata, by = "IID") 
-```
-
-```{r single-k-analysis}
-# Load K=2 admixture results
-q2 <- read.table(
-  file.path(reports_path, "admixture", "wm_europe_biallelic_filtered_id_phased.2.Q"),
-  header = FALSE
-)
-
-# Combine admixture results with sample information
-admix <- cbind(ids_admix, q2)
-
-# Sort individuals by latitude (north to south)
-admix <- admix %>%
-  arrange(desc(latitude)) %>%
-  mutate(
-    x_pos = row_number(),              # numeric position along x-axis
-    IID = factor(IID, levels = IID)    # preserve plotting order
-  )
-
-# Reshape admixture proportions to long format
-admix_long <- admix %>%
-  pivot_longer(
-    cols = starts_with("V"),
-    names_to = "K",
-    values_to = "proportion"
-  )
-
-# Find one representative (most centered) IID for each region
-region_centers <- admix %>%
-  group_by(region) %>%
-  summarise(
-    center_pos = round(mean(x_pos)),
-    .groups = "drop"
-  )
-
-center_labels <- admix %>%
-  select(IID, region, x_pos) %>%
-  left_join(region_centers, by = "region") %>%
-  group_by(region) %>%
-  slice_min(order_by = abs(x_pos - center_pos), n = 1, with_ties = FALSE) %>%
-  ungroup()
-
-# Build label vector: blank everywhere except the centered sample of each region
-label_vec <- setNames(rep("", nrow(admix)), as.character(admix$IID))
-label_vec[as.character(center_labels$IID)] <- as.character(center_labels$region)
-
-# Create admixture plot
-admixture_plot <- ggplot(admix_long, aes(x = IID, y = proportion, fill = K)) +
-  geom_bar(stat = "identity", position = "stack", width = 1) +
-  theme_minimal(base_family = "roboto") +
-  theme(
-    panel.grid = element_blank(),
-    panel.background = element_blank(),
-    legend.title = element_blank(),
-    legend.position = "none",
-    axis.text.x = element_text(angle = 45, hjust = 1),
-    axis.title.x = element_blank(),
-    axis.title.y = element_blank(),
-    axis.text.y = element_blank(),
-    text = element_text(family = "roboto_condensed", size = 16)
-  ) +
-  scale_fill_manual(values = admix_colors) +
-  scale_x_discrete(labels = label_vec)
-
-# Save figure
-ggsave(
-  filename = file.path(figures_path, "admixture_k2.png"),
-  plot = admixture_plot,
-  width = 18,
-  height = 3,
-  dpi = 300
-)
 ```
 
 ```{r}
@@ -179,7 +108,7 @@ make_admixture_plot <- function(k, ids_admix, reports_path, figures_path) {
       axis.text.y = element_blank(),
       text = element_text(family = "roboto_condensed", size = 16)
     ) +
-    scale_fill_manual(values = admix_colors) +
+    scale_fill_manual(values = rep(admix_colors, length.out = length(unique(admix_long$Kcomp))))+
     scale_x_discrete(labels = label_vec) +
     labs(title = paste0("K = ", k))
 
@@ -187,7 +116,7 @@ make_admixture_plot <- function(k, ids_admix, reports_path, figures_path) {
 }
 
 # Build plots for K = 1..10
-plots <- lapply(2:3, function(k) {
+plots <- lapply(c(1:10), function(k) {
   make_admixture_plot(k, ids_admix, reports_path, figures_path)
 })
 
@@ -196,10 +125,10 @@ combined_plot <- wrap_plots(plots, ncol = 1)
 
 # Save combined figure
 ggsave(
-  filename = file.path(figures_path, "admixture_k2_to_k3.png"),
+  filename = file.path(figures_path, "admixture_k1_to_k10.png"),
   plot = combined_plot,
-  width = 18,
-  height = 8,
+  width = 10,
+  height = 16,
   dpi = 300
 )
 ```

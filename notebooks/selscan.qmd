@@ -1,0 +1,66 @@
+---
+title: "selscan"
+author: "Andrea Estandia"
+date: "07/04/2026"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+# Knitr settings: 
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+options(scipen = 999)
+```
+
+```{r}
+source("./src/wm-europe_source.R")
+```
+
+```{r}
+pops <- c("uk", "shetland", "norway", "spain")
+chrs <- c("chr1", "chr2")
+
+nsl_all <- expand.grid(pop = pops, chr = chrs, stringsAsFactors = FALSE) %>%
+  as_tibble() %>%
+  mutate(
+    file = file.path(
+      reports_path,
+      "selection",
+      pop,
+      "nsl",
+      chr,
+      paste0(pop, "_", chr, "_nsl.nsl.out")
+    ),
+    data = map(file, \(f) {
+      if (!file.exists(f)) return(NULL)
+      fread(f, header = TRUE) %>%
+        dplyr::select(-dplyr::any_of(c("pop", "chr")))
+    })
+  ) %>%
+  select(pop, chr, data) %>%
+  tidyr::unnest(data)
+
+
+nsl_all <-
+nsl_all %>%
+  filter(nsl > 0.5) %>%
+  ggplot(aes(x = pos, y = nsl,col=chr)) +
+  geom_point(size = 0.6, alpha = 0.6) +
+  facet_grid(pop ~ chr) +
+  theme_bw() +
+  labs(
+    x = "Position",
+    y = "nSL",
+    title = "nSL values across chr1 and chr2 for each population"
+  )
+
+ggsave(
+ nsl_all,
+  filename=file.path(figures_path, "selection", "nsl_all.png"),
+  width = 10,
+  height = 8,
+  dpi = 300
+)
+```
