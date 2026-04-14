@@ -23,6 +23,7 @@ suppressPackageStartupMessages({
   library(data.table) 
   library(geosphere)
   library(scales)
+  library(purrr)
 
 })
 
