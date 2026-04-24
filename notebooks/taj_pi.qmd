@@ -52,8 +52,8 @@ make_taj_plot <- function(pop, reports_path) {
       legend.position = "none",
       plot.title = element_text(face = "bold", hjust = 0.5)
     ) +
-    geom_hline(yintercept = -5 * sd(taj$TajimaD, na.rm = TRUE), linetype = "dashed") +
-    geom_hline(yintercept =  5 * sd(taj$TajimaD, na.rm = TRUE), linetype = "dashed") +
+    geom_hline(yintercept = -2, linetype = "dashed") +
+    geom_hline(yintercept =  2, linetype = "dashed") +
     scale_x_continuous(
       breaks = axisdf$center,
       labels = gsub("chr|scaffold", "", axisdf$CHROM),
@@ -129,7 +129,7 @@ combined_plot <- taj_col | pi_col
 combined_plot
 
 ggsave(
-  filename = file.path(figures_path, "tajimasD_pi_50kb.png"),
+  filename = file.path(figures_path, "tajimasD", "tajimasD_pi_50kb.png"),
   plot = combined_plot,
   width = 12,
   height = 12,
