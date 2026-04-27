@@ -60,7 +60,7 @@ combined_ld <- wrap_plots(ld_plots, ncol = 1)
 combined_ld
 
 ggsave(
-  file.path(figures_path, "wm_europe_ld_decay_all_pops.png"),
+  file.path(figures_path, "ld", "wm_europe_ld_decay_all_pops.png"),
   plot = combined_ld,
   width = 7,
   height = 10,

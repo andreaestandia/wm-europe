@@ -20,7 +20,21 @@ source("./src/wm-europe_source.R")
 
 ```{r}
 pixy <- 
-read.table(file.path(reports_path, "pixy", "pixy_dxy.txt"), header = TRUE)
+read.table(file.path(reports_path, "pixy", "pixy_dxy.txt"), header = FALSE)
+
+colnames(pixy) <- c(
+  "stat",
+  "pop1",
+  "pop2",
+  "chromosome",
+  "window_pos_1",
+  "window_pos_2",
+  "avg_dxy",
+  "no_sites",
+  "col9",
+  "col10",
+  "col11"
+)
 ```
 
 ```{r}
@@ -85,7 +99,7 @@ combined_pixy <- wrap_plots(pixy_plots, ncol = 1)
 combined_pixy
 
 ggsave(
-  filename = file.path(figures_path, "pixy_dxy_all_pairs.png"),
+  filename = file.path(figures_path, "pixy", "pixy_dxy_all_pairs.png"),
   plot = combined_pixy,
   width = 12,
   height = 16,

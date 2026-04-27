@@ -1,0 +1,20 @@
+---
+title: "candidate_regions_selection"
+author: "Andrea Estandia"
+date: "27/04/2026"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+# Knitr settings: 
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+options(scipen = 999)
+```
+
+```{r}
+source("./src/wm-europe_source.R")
+```
+
