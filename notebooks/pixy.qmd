@@ -38,11 +38,14 @@ colnames(pixy) <- c(
 ```
 
 ```{r}
-make_pixy_plot <- function(pixy, pop_a, pop_b, min_sites = 100) {
+make_pixy_plot <- function(pixy, pop_a, pop_b, min_sites = 500) {
 
   dat <- pixy %>%
     filter(pop1 == pop_a, pop2 == pop_b) %>%
-    filter(no_sites >= min_sites) %>%
+    # Low no_sites = mappability gap / repeat region → remove.
+    # window_pos_1 < 200 kb = chromosome-start artefact → remove.
+    filter(no_sites >= min_sites,
+           window_pos_1 >= 200000) %>%
     filter(!grepl("scaffold|mito", chromosome)) %>%
     arrange(chromosome, window_pos_1, window_pos_2)
 

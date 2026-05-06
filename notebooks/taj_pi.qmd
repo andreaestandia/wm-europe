@@ -26,11 +26,17 @@ make_taj_plot <- function(pop, reports_path) {
     paste0(pop, "_tajimasD_50kb.Tajima.D")
   )
 
-  taj <- data.table::fread(file_path, header = TRUE)
-  taj$n <- seq_len(nrow(taj))
+  taj <- data.table::fread(file_path, header = TRUE) %>%
+    # Remove scaffolds, mito, chromosome-start artefact windows (first 200 kb),
+    # and windows with fewer than 500 SNPs (low-density → unreliable D estimate).
+    filter(
+      !grepl("scaffold|mito", CHROM),
+      BIN_START >= 200000,
+      N_SNPS    >= 500
+    )
 
-  taj <- taj %>%
-    filter(!grepl("scaffold|mito", CHROM))
+  # Assign sequential index AFTER filtering so geom_line has no spurious jumps.
+  taj$n <- seq_len(nrow(taj))
 
   chrom_levels <- unique(taj$CHROM)
 
@@ -41,7 +47,7 @@ make_taj_plot <- function(pop, reports_path) {
   taj <- taj %>%
     mutate(CHROM = factor(CHROM, levels = chrom_levels))
 
-  ggplot(taj %>% filter(N_SNPS > 500), aes(x = n, y = TajimaD, col = CHROM)) +
+  ggplot(taj, aes(x = n, y = TajimaD, col = CHROM)) +
     geom_line() +
     theme_minimal() +
     theme(
@@ -74,14 +80,18 @@ make_pi_plot <- function(pop, reports_path) {
     paste0(pop, "_pi_50kb.windowed.pi")
   )
 
-  pi_dat <- data.table::fread(file_path, header = TRUE)
+  pi_dat <- data.table::fread(file_path, header = TRUE) %>%
+    # Remove scaffolds, mito, chromosome-start artefact windows (first 200 kb),
+    # and windows with fewer than 500 variants (low-density → unreliable π).
+    filter(
+      !grepl("scaffold|mito", CHROM),
+      BIN_START   >= 200000,
+      N_VARIANTS  >= 500
+    )
 
-  # If your pi file uses BIN_START / BIN_END, this gives a midpoint axis
-  pi_dat$n <- seq_len(nrow(pi_dat))
+  # Assign sequential index AFTER filtering so geom_line has no spurious jumps.
+  pi_dat$n   <- seq_len(nrow(pi_dat))
   pi_dat$mid <- (pi_dat$BIN_START + pi_dat$BIN_END) / 2
-
-  pi_dat <- pi_dat %>%
-    filter(!grepl("scaffold|mito", CHROM))
 
   chrom_levels <- unique(pi_dat$CHROM)
 
@@ -92,7 +102,7 @@ make_pi_plot <- function(pop, reports_path) {
   pi_dat <- pi_dat %>%
     mutate(CHROM = factor(CHROM, levels = chrom_levels))
 
-  ggplot(pi_dat %>% filter(N_VARIANTS > 500), aes(x = n, y = PI, col = CHROM)) +
+  ggplot(pi_dat, aes(x = n, y = PI, col = CHROM)) +
     geom_line() +
     theme_minimal() +
     theme(
@@ -131,7 +141,7 @@ combined_plot
 ggsave(
   filename = file.path(figures_path, "tajimasD", "tajimasD_pi_50kb.png"),
   plot = combined_plot,
-  width = 12,
+  width = 16,
   height = 12,
   dpi = 300
 )

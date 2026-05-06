@@ -18,48 +18,405 @@ options(scipen = 999)
 source("./src/wm-europe_source.R")
 ```
 
+
 ```{r}
-pca <- fread(file.path(reports_path, "local_pca", "1000", "pcoa_coords.tsv"))
+# define chromosome order
+chroms <- c(as.character(1:14), "Z")
+
+# function to read one chromosome
+read_chr <- function(chr) {
+  fread(file.path(reports_path, "local_pca", "100", chr, "pcoa_coords.tsv")) %>%
+    mutate(
+      chr = gsub("^chr", "", chr),
+      landmark = as.character(landmark)   # <-- fix here
+    )
+}
+
+# read all and combine
+pca_list <- map(chroms, read_chr)
+pca <- bind_rows(pca_list)
+
+pca <- pca %>%
+  arrange(factor(chr, levels = chroms), window_id) %>%
+  group_by(chr) %>%
+  mutate(chr_max = max(window_id)) %>%
+  ungroup() %>%
+  mutate(offset = lag(cumsum(chr_max), default = 0)) %>%
+  mutate(window_id = window_id + offset)
+
+pca <- pca %>%
+  mutate(landmark = paste0("chr", chr))
+
+pca <- pca %>%
+  mutate(landmark = factor(landmark, levels = paste0("chr", chroms)))
 
 axisdf <- pca %>%
-    group_by(landmark) %>%
-    summarize(center = (max(window_id) + min(window_id)) / 2, .groups = "drop")
+  group_by(landmark) %>%
+  summarize(center = (max(window_id) + min(window_id)) / 2, .groups = "drop")
 
 local_pca <- 
-pca %>% 
-  ggplot(aes(x=window_id, y=PC1, col=as.factor(landmark))) +
+pca %>%
+  # Remove windows whose first SNP falls in the first 200 kb of a chromosome.
+  # These subtelomeric windows have inflated PC scores due to low recombination,
+  # assembly gaps, and unreliable genotyping — they are not interpretable as
+  # selection signals.
+  filter(as.integer(str_extract(position, "\\d+")) >= 200000) %>%
+  ggplot(aes(x = window_id, y = PC1, col = as.factor(landmark))) +
   geom_point() +
   scale_x_continuous(
-      breaks = axisdf$center,
-      labels = gsub("chr|scaffold", "", axisdf$landmark),
-      expand = c(0.01, 0.01)
-    ) +
-    scale_color_manual(values = rep(c("#2C3E50", "#95A5A6"), 26)) +
+    breaks = axisdf$center,
+    labels = gsub("chr|scaffold", "", axisdf$landmark),
+    expand = c(0.01, 0.01)
+  ) +
+  scale_color_manual(
+ values = rep(c("#2C3E50", "#95A5A6"), length.out = length(chroms))
+) +
   theme_minimal() +
-    theme(
-      panel.grid = element_blank(),
-      axis.line = element_line(color = "black"),
-      axis.ticks = element_line(color = "black"),
-      text = element_text(family = "roboto_condensed", size = 16),
-      legend.position = "none",
-      plot.title = element_text(face = "bold", hjust = 0.5),
-      plot.subtitle = element_text(hjust = 0.5) 
-    ) +
-    geom_hline(yintercept = 0, linetype = "dashed") +
-    geom_hline(yintercept = 4*sd(pca$PC1, na.rm = TRUE), linetype = "dashed") +
-    geom_hline(yintercept = -4*sd(pca$PC1, na.rm = TRUE), linetype = "dashed") +
-    labs(
-      x = "\nChromosome",
-      y = "PC1\n",
-      title = "Local PCA: PC1 values across genomic 1000bp windows",
-      subtitle = "Dashed lines indicate 4 standard deviations from the mean"
-    )
+  theme(
+    panel.grid = element_blank(),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black"),
+    text = element_text(family = "roboto_condensed", size = 16),
+    legend.position = "none",
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5) 
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = 4 * sd(pca$PC1, na.rm = TRUE), linetype = "dashed") +
+  geom_hline(yintercept = -4 * sd(pca$PC1, na.rm = TRUE), linetype = "dashed") +
+  labs(
+    x = "\nChromosome",
+    y = "PC2\n",
+    title = "Local PCA: PC1 values across genomic 100bp windows",
+    subtitle = "Dashed lines indicate 4 standard deviations from the mean"
+  )
 
 ggsave(
   local_pca,
-  filename = file.path(figures_path, "local_pca", "local_pca_plot.png"),
-  width = 9,
+  filename = file.path(figures_path, "local_pca", "local_pca_plot_PC1.png"),
+  width = 16,
   height = 4
 )
+```
 
+```{r}
+# ── 1. Read + prepare PCA data ───────────────────────────────────────────────
+pca_raw <- bind_rows(map(chroms, read_chr)) %>%
+  arrange(factor(chr, levels = chroms), window_id) %>%
+  mutate(
+    coords = map(position, extract_bounds),
+    start  = map_int(coords, "start"),
+    end    = map_int(coords, "end")
+  ) %>%
+  select(-coords) %>%
+  # Remove subtelomeric windows (first 200 kb per chromosome): low
+  # recombination and assembly gaps inflate PC scores there spuriously.
+  filter(start >= 200000)
+
+# ── 2. Global outlier detection (LEFT TAIL, matches your manual filter) ──────
+flag_outliers_global <- function(df, pc_col, sd_thresh = 4) {
+  
+  mu  <- mean(df[[pc_col]], na.rm = TRUE)
+  sig <- sd(df[[pc_col]],   na.rm = TRUE)
+  
+  df %>%
+    mutate(
+      value   = .data[[pc_col]],
+      outlier = value < (mu - sd_thresh * sig),  # left tail only
+      pc      = pc_col
+    ) %>%
+    filter(outlier) %>%
+    select(chr, start, end, pc, value)
+}
+
+# Apply across PCs
+outliers <- bind_rows(
+  flag_outliers_global(pca_raw, "PC1"),
+  flag_outliers_global(pca_raw, "PC2"),
+  flag_outliers_global(pca_raw, "PC3")
+)
+
+# ── 3. Merge nearby outlier windows into regions ─────────────────────────────
+merge_windows <- function(df, max_gap = 100000, min_windows = 5) {
+  df %>%
+    arrange(chr, pc, start) %>%
+    group_by(chr, pc) %>%
+    mutate(
+      gap = start - lag(start),
+      new_group = cumsum(is.na(gap) | gap > max_gap)
+    ) %>%
+    group_by(chr, pc, new_group) %>%
+    summarise(
+      region_start = min(start),
+      region_end   = max(end),
+      n_windows    = n(),
+      .groups = "drop"
+    ) %>%
+    filter(n_windows >= min_windows)
+}
+
+regions <- merge_windows(outliers)
+
+# ── 4. Output ────────────────────────────────────────────────────────────────
+print(regions, n = 50)
+
+write.csv(
+  regions,
+  file.path(reports_path, "local_pca", "pc_outlier_regions.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+outliers_path <- file.path(reports_path, "local_pca", "outliers")
+
+# ── Load sample metadata (adjust path / sex column name as needed) ────────────
+sample_info <- fread(file.path(data_path, "dfs_processed", "wgs_europe_metadata.csv")) %>%
+  select(sample_name, sex, region) %>%
+  rename(IID = sample_name)
+
+# ── Helper: read eigenvec + eigenval, join metadata, plot ─────────────────────
+plot_region_pca <- function(region_dir, sample_info) {
+
+  region_label <- basename(region_dir)
+
+  eigenvec_file <- file.path(region_dir, paste0(region_label, "_pca.eigenvec"))
+  eigenval_file <- file.path(region_dir, paste0(region_label, "_pca.eigenval"))
+
+  if (!file.exists(eigenvec_file)) {
+    message("Skipping (no eigenvec): ", region_label)
+    return(NULL)
+  }
+
+  # ── Read files ──────────────────────────────────────────────────────────────
+  ev <- fread(eigenvec_file, header = FALSE) %>%
+    setNames(c("FID", "IID", paste0("PC", 1:(ncol(.) - 2))))
+
+  eigenvals <- fread(eigenval_file, header = FALSE)$V1
+  pct       <- round(eigenvals / sum(eigenvals) * 100, 1)
+
+  plot_df <- ev %>% left_join(sample_info, by = "IID")
+  plot_df$PC1 <- as.numeric(as.character(plot_df$PC1))
+  plot_df$PC2 <- as.numeric(as.character(plot_df$PC2))
+
+  # ── Parse label for subtitle ────────────────────────────────────────────────
+  # label format: chrX_PCY_start_end
+  parts <- str_match(region_label, "chr(.+)_(PC\\d)_(\\d+)_(\\d+)")
+  chr   <- parts[2]; pc <- parts[3]
+  start <- as.integer(parts[4]); end <- as.integer(parts[5])
+  subtitle <- glue::glue("chr{chr}:{start}-{end}  |  flagged by {pc}")
+
+  # ── Plot ────────────────────────────────────────────────────────────────────
+  # ── Plot ────────────────────────────────────────────────────────────────────
+p <- ggplot(plot_df, aes(x = PC1, y = PC2, colour = region)) +
+  geom_point(size = 3, alpha = 0.85) +
+  scale_colour_manual(
+    values = c(
+      "Spain"    = "#E41A1C",
+      "UK"       = "#377EB8",
+      "Norway"   = "#4DAF4A",
+      "Shetland" = "#984EA3"
+    ),
+    name = "Region",
+    na.value = "#95A5A6"
+  ) +
+scale_x_continuous(expand = c(0, 0)) +
+scale_y_continuous(expand = c(0, 0)) +
+  labs(
+    subtitle = subtitle,
+    x = paste0("\nPC1 (", pct[1], "%)\n"),
+    y = paste0("\nPC2 (", pct[2], "%)\n")
+  ) +
+  theme(
+  panel.grid = element_blank(),
+  panel.background = element_blank(),
+  plot.background = element_blank(),
+  text = element_text(family = "roboto_condensed", size = 14),
+  plot.subtitle = element_text(hjust = 0.5, colour = "grey40"),
+  legend.position = "right"
+)
+
+  out_file <- file.path(figures_path, "local_pca", paste0(region_label, "_pca.png"))
+  ggsave(p, filename = out_file, width = 6, height = 5, dpi = 150)
+  message("Saved: ", out_file)
+  return(p)
+}
+
+# ── Run over all region directories ──────────────────────────────────────────
+region_dirs <- list.dirs(outliers_path, recursive = FALSE, full.names = TRUE)
+
+plots <- map(region_dirs, plot_region_pca, sample_info = sample_info)
+
+# ── Optional: single combined panel ──────────────────────────────────────────
+plots_clean <- compact(plots)
+
+combined <- wrap_plots(plots_clean, ncol = 4) +
+  plot_annotation(
+    title = "Local PCA outlier regions — PLINK PCA",
+    theme = theme(
+      plot.title = element_text(family = "roboto_condensed", face = "bold",
+                                size = 16, hjust = 0.5)
+    )
+  )
+
+ggsave(
+  combined,
+  filename = file.path(figures_path, "local_pca", "all_regions_combined.png"),
+  width = 24, height = ceiling(length(plots_clean) / 4) * 5,
+  dpi = 150
+)
+```
+
+
+```{r}
+# ── Choose ONE region (EDIT THIS BLOCK) ──────────────────────────────────────
+chr   <- "3"
+pc    <- "PC3"
+start <- 35721485
+end   <- 35831305
+
+region_label <- paste0("chr", chr, "_", pc, "_", start, "_", end)
+region_dir   <- file.path(outliers_path, region_label)
+
+# ── Check inputs exist ───────────────────────────────────────────────────────
+eigenvec_file <- file.path(region_dir, paste0(region_label, "_pca.eigenvec"))
+eigenval_file <- file.path(region_dir, paste0(region_label, "_pca.eigenval"))
+
+if (!file.exists(eigenvec_file)) {
+  stop("Missing eigenvec file: ", eigenvec_file)
+}
+if (!file.exists(eigenval_file)) {
+  stop("Missing eigenval file: ", eigenval_file)
+}
+
+# ── Read PCA outputs ─────────────────────────────────────────────────────────
+ev <- fread(eigenvec_file, header = FALSE)
+setNames(ev, c("FID", "IID", paste0("PC", 1:(ncol(ev) - 2)))) -> ev
+
+eigenvals <- fread(eigenval_file, header = FALSE)$V1
+pct       <- round(eigenvals / sum(eigenvals) * 100, 1)
+
+# ── Read heterozygosity output ─────────────────────────────────────────────────
+het_file <- file.path(region_dir, paste0(region_label, "_het.het"))
+
+het_info <- fread(het_file, header = TRUE) %>%
+  select(INDV, F) %>%
+  rename(IID = INDV, F_het = F)
+
+# ── Merge metadata ───────────────────────────────────────────────────────────
+plot_df <- ev %>%
+  left_join(sample_info, by = "IID") %>%
+  left_join(het_info, by = "IID")
+
+# ── Subtitle ─────────────────────────────────────────────────────────────────
+subtitle <- glue("chr{chr}:{start}-{end}  |  flagged by {pc}")
+
+# ── Plot ─────────────────────────────────────────────────────────────────────
+p <- plot_df %>%
+mutate(
+    PC1 = as.numeric(PC1),
+    PC2 = as.numeric(PC2)
+  ) %>%
+filter(!is.na(region)) %>%  
+ggplot(aes(x = PC1, y = PC2, colour = region)) +
+  geom_point(size = 3, alpha = 0.85) +
+  scale_colour_manual(
+    values = c(
+      "Spain"    = "#E41A1C",
+      "UK"       = "#377EB8",
+      "Norway"   = "#4DAF4A",
+      "Shetland" = "#984EA3"
+    ),
+    name = "Region",
+    na.value = "#95A5A6"
+  ) +
+scale_x_continuous(expand = c(0, 0)) +
+scale_y_continuous(expand = c(0, 0)) +
+  labs(
+    subtitle = subtitle,
+    x = paste0("PC1 (", pct[1], "%)"),
+    y = paste0("PC2 (", pct[2], "%)")
+  ) +
+  theme(
+  panel.grid = element_blank(),
+  panel.background = element_blank(),
+  plot.background = element_blank(),
+  text = element_text(family = "roboto_condensed", size = 14),
+  plot.subtitle = element_text(hjust = 0.5, colour = "grey40"),
+  legend.position = "right"
+)
+
+t <- plot_df %>%
+mutate(
+    PC1 = as.numeric(PC1),
+    PC2 = as.numeric(PC2)
+  ) %>%
+filter(!is.na(region)) %>%  
+ggplot(aes(x = PC1, y = PC2, colour = F_het)) +
+  geom_point(size = 3, alpha = 0.85) +
+scale_x_continuous(expand = c(0, 0)) +
+scale_y_continuous(expand = c(0, 0)) +
+  scale_colour_viridis_c(option = "C") +
+  labs(
+    subtitle = subtitle,
+    x = paste0("PC1 (", pct[1], "%)"),
+    y = paste0("PC2 (", pct[2], "%)")
+  ) +
+  theme(
+  panel.grid = element_blank(),
+  panel.background = element_blank(),
+  plot.background = element_blank(),
+  text = element_text(family = "roboto_condensed", size = 14),
+  plot.subtitle = element_text(hjust = 0.5, colour = "grey40"),
+  legend.position = "right"
+)
+
+# ── Save output ──────────────────────────────────────────────────────────────
+out_file <- file.path(figures_path, "local_pca", paste0(region_label, "_pca.png"))
+dir.create(dirname(out_file), recursive = TRUE, showWarnings = FALSE)
+
+g <- p+t
+
+ggsave(g, filename = out_file, width = 12, height = 5, dpi = 150)
+
+message("Saved: ", out_file)
+
+# ── Return plot to viewer ────────────────────────────────────────────────────
+print(p)
+
+cluster1 <- plot_df %>%
+  filter(PC1<0.05) %>%
+  pull(IID)
+
+cluster2 <- plot_df %>%
+  filter(PC1>0.05 & PC1<0.1) %>%
+  pull(IID)
+
+cluster3 <- plot_df %>%
+  filter(PC1>=0.1) %>%
+  pull(IID)
+
+write.table(
+  cluster1,
+  file.path(reports_path, "local_pca", "outliers", "chr3_cluster1_samples.csv"),
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
+
+write.table(
+  cluster2,
+  file.path(reports_path, "local_pca", "outliers", "chr3_cluster2_samples.csv"),
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
+
+write.table(
+  cluster3,
+  file.path(reports_path, "local_pca", "outliers", "chr3_cluster3_samples.csv"),
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
 ```

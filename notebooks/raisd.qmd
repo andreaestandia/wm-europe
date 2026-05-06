@@ -33,16 +33,61 @@ df <- rbindlist(lapply(paths, function(p) {
   
   cbind(
     pop = pop,
-    fread(p, col.names = c("chr", "position", "mu"))
+    fread(p, col.names = c(
+      "chr",
+      "position",
+      "win_start",
+      "win_end",
+      "VAR",
+      "SFS",
+      "LD",
+      "mu"
+    ))
   )
 }))
+
+# ── Filtering ─────────────────────────────────────────────────────────────────
+# 1. Remove first 200 kb (telomere artifact)
+# 2. Compute SNP-density proxy: VAR / window span
+# 3. Remove lowest 5% of SNP-density windows (global cutoff across all pops)
+
+DENSITY_CUTOFF <- 0.05
+
+df_filtered <- df %>%
+  filter(position >= 200000) %>%
+  mutate(
+    win_span = win_end - win_start,
+    snp_density = VAR / win_span
+  ) %>%
+  mutate(
+    density_cutoff = quantile(snp_density, DENSITY_CUTOFF, na.rm = TRUE)
+  ) %>%
+  filter(snp_density >= density_cutoff) %>%
+  select(-density_cutoff)
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+cat("Windows removed:", nrow(df) - nrow(df_filtered), "\n")
+
+# Optional sanity check
+df %>%
+  group_by(pop) %>%
+  summarise(
+    mean_VAR = mean(VAR, na.rm = TRUE),
+    mean_span = mean(win_end - win_start, na.rm = TRUE),
+    mean_density = mean(VAR / (win_end - win_start), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+df_filtered %>%
+  ggplot(aes(x = VAR)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~ pop, scales = "free_y")
 
 ```
 
 ```{r}
-
 # order chromosomes once, globally
-chr_levels <- df %>%
+chr_levels <- df_filtered %>%
   distinct(chr) %>%
   mutate(chr_num = as.numeric(str_extract(chr, "\\d+"))) %>%
   arrange(chr_num, chr) %>%
@@ -74,8 +119,8 @@ plot_raisd_pop <- function(dat, pop_name) {
   d <- prep$data
   axisdf <- prep$axisdf
 
-  ggplot(d, aes(x = genome_pos, y = mu, col = chr)) +
-    geom_point(size = 0.6, alpha = 0.8) +
+  ggplot(d, aes(x = genome_pos, y = VAR, col = chr)) +
+    geom_line(linewidth = 0.3) +
     scale_x_continuous(
       breaks = axisdf$center,
       labels = gsub("chr", "", axisdf$chr),
@@ -93,19 +138,19 @@ plot_raisd_pop <- function(dat, pop_name) {
     ) +
     labs(
       x = "\nChromosome",
-      y = "mu\n",
+      y = "μ_VAR\n",
       title = paste("RAiSD:", pop_name)
     )
 }
 
-plots <- lapply(split(df, df$pop), function(d) {
+plots <- lapply(split(df_filtered, df_filtered$pop), function(d) {
   plot_raisd_pop(d, unique(d$pop))
 })
 
 ggsave(
   wrap_plots(plots, ncol = 1),
   filename = file.path(figures_path, "raisd", "raisd_plot.png"),
-  width = 8,
-  height = 12
+  height = 8,
+  width = 16
 )
 ```

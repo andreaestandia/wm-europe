@@ -18,3 +18,1507 @@ options(scipen = 999)
 source("./src/wm-europe_source.R")
 ```
 
+```{r params}
+# ============================================================
+# PARAMETERS — adjust as needed
+# ============================================================
+BIN_SIZE    <- 50000   # 50 kb resolution (matches windowed analyses)
+BUFFER      <- 100000  # ± 100 kb buffer: outliers within this distance are linked
+TAJ_D_THR   <- -2      # Tajima's D < threshold → sweep signal
+RAISD_QTHR  <- 0.999  # Top 0.1 % VAR scores per chr × population
+PIXY_QTHR   <- 0.99   # Top 0.1 % dxy per population pair
+SELSCAN_QTHR <- 0.99  # Top 0.1 % |nSL| / |iHS| per chr × population
+XPEHH_QTHR  <- 0.995  # Top 0.1 % |norm_xpehh| per chr × pair (two-tail)
+MIN_METHODS    <- 2       # Minimum distinct methods required to call a candidate
+MIN_BIN_SNPS   <- 50      # Min variants per 50kb bin in the GWAS VCF; below = SNP desert
+CHR_START_TRIM <- 200000  # Drop first 200 kb of every chromosome (telomere artefact)
+
+POPS   <- c("uk", "shetland", "norway", "spain")
+CHROMS <- c(paste0("chr", 1:14), "chrZ")
+
+# GWAS — path to GEMMA association file (external project)
+GWAS_PATH     <- "/Volumes/LaCie/wm-gwas/reports/gwas/wm-gwas.gemma_GLs_filtered.assoc.txt"
+GWAS_PVAL_THR <- 0.05   # Bonferroni threshold numerator; denominator = nrow(assoc)
+```
+
+```{r helpers}
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+# Floor a genomic position to the nearest BIN_SIZE boundary
+bin_pos <- function(pos) floor(pos / BIN_SIZE) * BIN_SIZE
+
+# Given a data.table of outlier bins (chr, bin, source, pop),
+# expand each bin left and right by BUFFER, then deduplicate
+expand_buffer <- function(dt, buffer = BUFFER, bin_size = BIN_SIZE) {
+  n_steps <- round(buffer / bin_size)
+  offsets <- seq(-n_steps, n_steps) * bin_size
+  rbindlist(lapply(offsets, function(off) {
+    d      <- copy(as.data.table(dt))
+    d[, bin := bin + off]
+    d
+  }))[bin >= 0] |> distinct(chr, bin, source, pop)
+}
+
+# Merge consecutive or touching bins into contiguous regions,
+# then collapse method and population metadata across each region
+merge_bins_to_regions <- function(score_dt, bin_size = BIN_SIZE) {
+  score_dt |>
+    arrange(chr, bin) |>
+    group_by(chr) |>
+    mutate(
+      gap      = bin - lag(bin, default = first(bin)),
+      new_blk  = gap > bin_size | row_number() == 1L,
+      block_id = cumsum(new_blk)
+    ) |>
+    group_by(chr, block_id) |>
+    summarise(
+      region_start   = min(bin),
+      region_end     = max(bin) + bin_size - 1L,
+      region_len_kb  = (max(bin) - min(bin) + bin_size) / 1e3,
+      n_support_bins = n(),
+      n_methods      = max(n_methods),
+      methods        = paste(
+        sort(unique(unlist(strsplit(methods, "\\|")))),
+        collapse = "|"
+      ),
+      n_pops         = max(n_pops),
+      pops           = paste(
+        sort(unique(unlist(strsplit(pops, "\\|")))),
+        collapse = "|"
+      ),
+      .groups = "drop"
+    ) |>
+    select(-block_id) |>
+    arrange(desc(n_methods), desc(n_support_bins))
+}
+```
+
+```{r load_local_pca}
+# ============================================================
+# 1. LOCAL PCA — population-agnostic; regions already delimited
+#    chr values stored without "chr" prefix in this file
+# ============================================================
+lpca_raw <- fread(
+  file.path(reports_path, "local_pca", "pc_outlier_regions.csv")
+) |>
+  mutate(chr = paste0("chr", chr))
+
+# Drop subtelomeric artefact regions (first 200 kb of each chromosome)
+lpca_bins <- lpca_raw |>
+  filter(region_start >= CHR_START_TRIM) |>
+  rowwise() |>
+  reframe(
+    chr = chr,
+    bin = seq(bin_pos(region_start), bin_pos(region_end), by = BIN_SIZE)
+  ) |>
+  distinct() |>
+  mutate(source = "local_pca", pop = "all") |>
+  as.data.table()
+
+cat("Local PCA: ", nrow(lpca_bins), "outlier bins across",
+    uniqueN(lpca_bins$chr), "chromosomes\n")
+```
+
+```{r load_tajimasD}
+# ============================================================
+# 2. TAJIMA'S D — 50-kb windows, per population
+#    Flag windows < TAJ_D_THR (negative = sweep signal)
+# ============================================================
+taj_bins <- rbindlist(lapply(POPS, function(p) {
+  f <- file.path(reports_path, "tajimasD",
+                 paste0(p, "_tajimasD_50kb.Tajima.D"))
+  if (!file.exists(f)) {
+    message("  [skip] Tajima's D not found for: ", p); return(NULL)
+  }
+  fread(f, header = TRUE)[
+    !grepl("scaffold|mito|unplaced", CHROM) &
+      BIN_START >= CHR_START_TRIM &   # telomere trim
+      N_SNPS    >= MIN_BIN_SNPS    &   # SNP-desert filter
+      TajimaD   <  TAJ_D_THR,
+    .(chr = CHROM, bin = bin_pos(BIN_START), source = "tajimas_d", pop = p)
+  ]
+}), fill = TRUE)
+
+cat("Tajima's D: ", nrow(taj_bins), "outlier bins across",
+    taj_bins[, uniqueN(pop)], "populations\n")
+```
+
+```{r load_raisd}
+# ============================================================
+# 3. RAiSD — per-SNP VAR statistic, per population
+#    Outliers = top RAISD_QTHR per chromosome × population
+# ============================================================
+raisd_bins <- rbindlist(lapply(POPS, function(p) {
+  f <- file.path(reports_path, "raisd",
+                 paste0("RAiSD_Report.wm_", p, ".clean.tsv"))
+
+  if (!file.exists(f)) {
+    message("  [skip] RAiSD not found for: ", p)
+    return(NULL)
+  }
+
+  dat <- fread(f, col.names = c(
+    "chr", "position", "win_start", "win_end",
+    "VAR", "SFS", "LD", "mu"
+  ))[
+    !grepl("scaffold|mito|unplaced", chr)
+  ]
+
+  # Threshold per chromosome
+  dat[, thr := quantile(VAR, RAISD_QTHR, na.rm = TRUE), by = chr]
+
+  # Filter + bin
+  dat[VAR >= thr & position >= 200000,
+      .(chr, bin = bin_pos(position), source = "raisd", pop = p)]
+
+}), fill = TRUE)
+
+cat("RAiSD: ", nrow(raisd_bins), "outlier bins across",
+    raisd_bins[, uniqueN(pop)], "populations\n")
+```
+
+```{r load_pixy}
+# ============================================================
+# 4. PIXY dxy — 50-kb windows, between population pairs
+#    High dxy = elevated differentiation; flag top PIXY_QTHR per pair
+# ============================================================
+pixy_raw <- fread(
+  file.path(reports_path, "pixy", "pixy_dxy.txt"),
+  header = FALSE,
+  col.names = c("stat", "pop1", "pop2", "chr",
+                "window_pos_1", "window_pos_2", "avg_dxy",
+                "no_sites", "col9", "col10", "col11")
+)
+
+pixy_bins <- pixy_raw[
+  !grepl("scaffold|mito|unplaced", chr) &
+    window_pos_1 >= CHR_START_TRIM &   # telomere trim
+    no_sites     >= MIN_BIN_SNPS        # SNP-desert filter
+][,
+  dxy_thr := quantile(avg_dxy, PIXY_QTHR, na.rm = TRUE),
+  by = .(pop1, pop2)
+][avg_dxy >= dxy_thr,
+  .(chr,
+    bin    = bin_pos(window_pos_1),
+    source = "pixy_dxy",
+    pop    = paste(pop1, pop2, sep = "_vs_"))
+]
+
+cat("Pixy dxy: ", nrow(pixy_bins), "outlier bins across",
+    pixy_bins[, uniqueN(pop)], "population pairs\n")
+```
+
+```{r load_gwas}
+# ============================================================
+# 5. GWAS — GEMMA association (population-agnostic)
+#    chr and position are encoded in the `rs` field as
+#    "chr1_32797:chr1:32797"; `chr` column itself is -9.
+#    Significant SNPs = Bonferroni-corrected at GWAS_PVAL_THR.
+# ============================================================
+gwas_raw <- fread(GWAS_PATH, header = TRUE)
+
+# Parse chromosome and position from the rs identifier
+gwas_raw[,
+  `:=`(
+    chr = str_extract(rs, "^[^_:]+"),          # "chr1"
+    pos = as.integer(str_extract(rs, "\\d+$")) # last integer = position
+  )
+]
+
+# Bonferroni threshold
+gwas_bonf <- GWAS_PVAL_THR / nrow(gwas_raw)
+cat(sprintf("GWAS Bonferroni threshold: p < %.2e  (-log10 = %.2f)\n",
+            gwas_bonf, -log10(gwas_bonf)))
+
+# Per-bin SNP density from ALL tested variants (pre-significance filter).
+# Used throughout to flag SNP deserts: mappability/repeat gaps where any
+# signal (elevated mu, negative D, high dxy) is likely an artefact.
+snp_density <- gwas_raw[
+  chr %in% CHROMS & !is.na(pos),
+  .(n_snps = .N),
+  by = .(chr, bin = bin_pos(pos))
+]
+low_density_bins <- snp_density[n_snps < MIN_BIN_SNPS, .(chr, bin)]
+cat(sprintf("Low-density bins (< %d SNPs/50kb): %d — excluded from all analyses\n",
+            MIN_BIN_SNPS, nrow(low_density_bins)))
+
+gwas_sig <- gwas_raw[
+  !grepl("scaffold|mito|unplaced|^-", chr) &
+    chr %in% CHROMS &
+    !is.na(p_score) &
+    pos >= CHR_START_TRIM &
+    p_score < gwas_bonf
+]
+
+gwas_bins <- gwas_sig[,
+  .(chr, bin = bin_pos(pos), source = "gwas", pop = "all")
+]
+
+cat("GWAS: ", nrow(gwas_sig), "significant SNPs →",
+    nrow(unique(gwas_bins[, .(chr, bin)])),
+    "unique 50-kb bins across", uniqueN(gwas_bins$chr), "chromosomes\n")
+
+# Keep the full significant SNP table for the overlap report later
+gwas_sig_full <- gwas_sig[, .(chr, pos, p_score, rs)]
+```
+
+```{r load_nsl}
+# ============================================================
+# 6. nSL — per-SNP, per population
+#    Outliers = top SELSCAN_QTHR of |nSL| per chr × population
+# ============================================================
+nsl_bins <- rbindlist(lapply(POPS, function(p) {
+  rbindlist(lapply(CHROMS, function(chr_name) {
+    f <- file.path(reports_path, "selection", p, "nsl", chr_name,
+                   paste0(p, "_", chr_name, "_nsl.nsl.out"))
+    if (!file.exists(f)) return(NULL)
+    dat_n <- fread(f, select = c("pos", "nsl"))[
+      !is.na(nsl) & !is.na(pos) & pos >= CHR_START_TRIM
+    ]
+    if (nrow(dat_n) == 0) return(NULL)
+    dat_n[, abs_nsl := abs(nsl)]
+    thr <- quantile(dat_n$abs_nsl, SELSCAN_QTHR, na.rm = TRUE)
+    dat_n[abs_nsl >= thr,
+          .(chr = chr_name, bin = bin_pos(pos), source = "nsl", pop = p)]
+  }), fill = TRUE)
+}), fill = TRUE)
+
+cat("nSL: ", nrow(nsl_bins), "outlier bins across",
+    nsl_bins[, uniqueN(pop)], "populations\n")
+```
+
+```{r load_ihs}
+# ============================================================
+# 7. iHS — per-SNP, per population
+#    Outliers = top SELSCAN_QTHR of |iHS| per chr × population
+# ============================================================
+ihs_bins <- rbindlist(lapply(POPS, function(p) {
+  rbindlist(lapply(CHROMS, function(chr_name) {
+    f <- file.path(reports_path, "selection", p, "ihs", chr_name,
+                   paste0(p, "_", chr_name, "_ihs.ihs.out"))
+    if (!file.exists(f)) return(NULL)
+    dat_i <- fread(f, select = c("pos", "ihs"))[
+      !is.na(ihs) & !is.na(pos) & pos >= CHR_START_TRIM
+    ]
+    if (nrow(dat_i) == 0) return(NULL)
+    dat_i[, abs_ihs := abs(ihs)]
+    thr <- quantile(dat_i$abs_ihs, SELSCAN_QTHR, na.rm = TRUE)
+    dat_i[abs_ihs >= thr,
+          .(chr = chr_name, bin = bin_pos(pos), source = "ihs", pop = p)]
+  }), fill = TRUE)
+}), fill = TRUE)
+
+cat("iHS: ", nrow(ihs_bins), "outlier bins across",
+    ihs_bins[, uniqueN(pop)], "populations\n")
+```
+
+```{r load_xpehh}
+# ============================================================
+# 8. XP-EHH — per-SNP, per population pair (normalised scores)
+#    Outliers = top XPEHH_QTHR of |norm_xpehh| per chr × pair
+# ============================================================
+XPEHH_PAIRS <- basename(
+  list.dirs(file.path(reports_path, "selection", "xpehh"), recursive = FALSE)
+)
+
+xpehh_bins <- rbindlist(lapply(XPEHH_PAIRS, function(pair_name) {
+  rbindlist(lapply(CHROMS, function(chr_name) {
+    f <- file.path(reports_path, "selection", "xpehh", pair_name, chr_name,
+                   paste0(pair_name, "_", chr_name, "_xpehh.xpehh.out.norm"))
+    if (!file.exists(f)) return(NULL)
+    dat_xp <- fread(f, select = c("pos", "norm_xpehh"))[
+      !is.na(norm_xpehh) & !is.na(pos) & pos >= CHR_START_TRIM
+    ]
+    if (nrow(dat_xp) == 0) return(NULL)
+    dat_xp[, abs_xp := abs(norm_xpehh)]
+    thr <- quantile(dat_xp$abs_xp, XPEHH_QTHR, na.rm = TRUE)
+    dat_xp[abs_xp >= thr,
+           .(chr = chr_name, bin = bin_pos(pos), source = "xpehh", pop = pair_name)]
+  }), fill = TRUE)
+}), fill = TRUE)
+
+cat("XP-EHH: ", nrow(xpehh_bins), "outlier bins across",
+    xpehh_bins[, uniqueN(pop)], "population pairs\n")
+```
+
+```{r combine_score}
+# ============================================================
+# 9. COMBINE ALL SOURCES, EXPAND BY BUFFER, SCORE BINS
+# ============================================================
+raisd_snp_density <- dat[, .(n_raisd_snps = .N), by = .(chr, bin = bin_pos(position))]
+# Then anti_join on bins below your threshold before calling outliers
+
+raw_outlier_bins <- rbindlist(
+  list(lpca_bins, taj_bins, raisd_bins, pixy_bins, gwas_bins,
+       nsl_bins, ihs_bins, xpehh_bins),
+  fill = TRUE
+)[chr %in% CHROMS] |>
+  distinct(chr, bin, source, pop) |>
+  # Remove SNP deserts: bins with < MIN_BIN_SNPS variants in the GWAS VCF.
+  # These are mappability / repeat gaps where signals from ANY method are
+  # unreliable and would inflate the candidate region count.
+  anti_join(low_density_bins, by = c("chr", "bin"))
+
+cat("Total raw outlier bins (after SNP-desert filter):", nrow(raw_outlier_bins), "\n")
+
+# Expand each outlier bin ± BUFFER
+expanded_bins <- expand_buffer(raw_outlier_bins)
+
+# Score each (chr, bin) by counting distinct methods and populations
+bin_scores <- expanded_bins[
+  ,
+  .(
+    n_methods = uniqueN(source),
+    methods   = paste(sort(unique(source)), collapse = "|"),
+    n_pops    = uniqueN(pop[pop != "all"]),   # exclude "all" (local_pca)
+    pops      = paste(sort(unique(pop)), collapse = "|")
+  ),
+  by = .(chr, bin)
+][n_methods >= MIN_METHODS][order(chr, bin)]
+
+cat("Bins supported by ≥", MIN_METHODS, "methods:", nrow(bin_scores), "\n")
+```
+
+```{r merge_regions}
+# ============================================================
+# 8. MERGE CONSECUTIVE BINS → CANDIDATE REGIONS
+# ============================================================
+candidate_regions <- merge_bins_to_regions(bin_scores)
+
+cat("\nCandidate regions for selection (≥", MIN_METHODS, "methods):",
+    nrow(candidate_regions), "\n\n")
+
+candidate_regions |>
+  select(chr, region_start, region_end, region_len_kb,
+         n_methods, methods, n_pops, pops) |>
+  print(n = 50)
+
+# Save
+fwrite(
+  candidate_regions,
+  file.path(reports_path, "selection", "candidate_regions_multimethod.csv")
+)
+```
+
+```{r method_comparison}
+# ============================================================
+# CROSS-METHOD OVERLAP — which methods flag the same regions?
+# ============================================================
+
+ALL_METHODS <- c("local_pca", "tajimas_d", "raisd",
+                 "nsl", "ihs", "pixy_dxy", "xpehh", "gwas")
+
+METHOD_LABELS <- c(
+  local_pca  = "Local PCA",
+  tajimas_d  = "Tajima's D",
+  raisd      = "RAiSD",
+  nsl        = "nSL",
+  ihs        = "iHS",
+  pixy_dxy   = "Pixy dxy",
+  xpehh      = "XP-EHH",
+  gwas       = "GWAS"
+)
+
+# Binary presence/absence matrix: region × method
+method_matrix <- candidate_regions |>
+  mutate(region_id = paste0(chr, ":", round(region_start / 1e6, 2),
+                            "-", round(region_end / 1e6, 2), " Mb"))
+
+method_flags <- map_dfc(
+  setNames(ALL_METHODS, ALL_METHODS),
+  ~ grepl(.x, method_matrix$methods, fixed = TRUE)
+)
+
+method_matrix <- bind_cols(method_matrix, method_flags) |>
+  select(region_id, chr, region_start, n_methods, all_of(ALL_METHODS))
+
+# --- Tile heatmap: regions x methods -------------------------
+method_long <- method_matrix |>
+  pivot_longer(all_of(ALL_METHODS), names_to = "method", values_to = "flagged") |>
+  mutate(
+    method    = factor(METHOD_LABELS[method], levels = rev(METHOD_LABELS)),
+    region_id = forcats::fct_reorder(region_id, -n_methods)
+  )
+
+p_heatmap <- ggplot(method_long,
+                    aes(x = region_id, y = method, fill = flagged)) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  scale_fill_manual(values = c("TRUE"  = "#e63946", "FALSE" = "#f0f0f0"),
+                    labels = c("TRUE"  = "flagged",  "FALSE" = "not flagged"),
+                    name   = NULL) +
+  labs(
+    title    = "Cross-method overlap — candidate regions",
+    subtitle = paste0("Each column = one candidate region  |  n = ",
+                      nrow(candidate_regions)),
+    x        = NULL,
+    y        = NULL
+  ) +
+  theme_classic() +
+  theme(
+    text            = element_text(family = "roboto_condensed", size = 12),
+    axis.text.x     = element_text(angle = 45, vjust = 0.5, size = 7),
+    axis.text.y     = element_text(size = 11),
+    plot.title      = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle   = element_text(hjust = 0.5, colour = "grey40"),
+    legend.position = "top"
+  )
+
+p_heatmap
+
+ggsave(
+  file.path(figures_path, "candidate_regions_method_overlap.pdf"),
+  p_heatmap, width = max(8, nrow(candidate_regions) * 0.35 + 3), height = 5.5
+)
+
+# --- Pairwise method co-occurrence (Jaccard similarity) ------
+# How often do two methods flag the same 50-kb bins?
+bin_method_mat <- raw_outlier_bins |>
+  distinct(chr, bin, source) |>
+  anti_join(low_density_bins, by = c("chr", "bin")) |>
+  filter(source %in% ALL_METHODS) |>
+  mutate(present = 1L) |>
+  pivot_wider(names_from = source, values_from = present, values_fill = 0L) |>
+  select(any_of(c("chr", "bin", ALL_METHODS)))
+
+method_cols <- intersect(ALL_METHODS, names(bin_method_mat))
+jaccard_mat <- outer(method_cols, method_cols, FUN = Vectorize(function(a, b) {
+  va <- bin_method_mat[[a]]; vb <- bin_method_mat[[b]]
+  both <- sum(va & vb); either <- sum(va | vb)
+  if (either == 0) return(NA_real_)
+  both / either
+}))
+dimnames(jaccard_mat) <- list(METHOD_LABELS[method_cols], METHOD_LABELS[method_cols])
+
+jaccard_long <- as.data.frame(as.table(jaccard_mat)) |>
+  rename(method_a = Var1, method_b = Var2, jaccard = Freq) |>
+  mutate(
+    method_a = factor(method_a, levels = METHOD_LABELS[method_cols]),
+    method_b = factor(method_b, levels = METHOD_LABELS[method_cols])
+  )
+
+p_jaccard <- ggplot(jaccard_long, aes(x = method_a, y = method_b, fill = jaccard)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = ifelse(is.na(jaccard), "", sprintf("%.2f", jaccard))),
+            size = 3, family = "roboto_condensed") +
+  scale_fill_gradient2(
+    low      = "#f7f7f7",
+    mid      = "#f4a261",
+    high     = "#e63946",
+    midpoint = 0.15,
+    na.value = "grey80",
+    name     = "Jaccard\nsimilarity",
+    limits   = c(0, 1)
+  ) +
+  labs(
+    title    = "Pairwise method co-occurrence (Jaccard similarity at 50-kb bin level)",
+    subtitle = paste0("Outlier bins only — buffer: +/-", BUFFER / 1e3, " kb"),
+    x        = NULL,
+    y        = NULL
+  ) +
+  coord_fixed() +
+  theme_classic() +
+  theme(
+    text          = element_text(family = "roboto_condensed", size = 12),
+    axis.text.x   = element_text(angle = 45, hjust = 1),
+    plot.title    = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, colour = "grey40")
+  )
+
+p_jaccard
+
+ggsave(
+  file.path(figures_path, "method_jaccard_similarity.pdf"),
+  p_jaccard, width = 7, height = 6
+)
+```
+
+```{r gwas_overlap}
+# ============================================================
+# 7. GWAS OVERLAP REPORT
+#    For each candidate region (± BUFFER), list the GWAS
+#    significant SNPs that fall inside it.
+# ============================================================
+
+# Build a range table: candidate regions expanded by BUFFER
+cand_ranges <- candidate_regions |>
+  transmute(
+    chr,
+    range_start = pmax(region_start - BUFFER, 0),
+    range_end   = region_end + BUFFER,
+    region_start,
+    region_end,
+    n_methods,
+    methods
+  ) |>
+  as.data.table()
+
+# Overlap via non-equi join (data.table rolling/range join)
+setkey(cand_ranges, chr, range_start, range_end)
+
+gwas_ol <- foverlaps(
+  gwas_sig_full[, .(chr, start = pos, end = pos, pos, p_score, rs)],
+  cand_ranges,
+  by.x = c("chr", "start", "end"),
+  by.y = c("chr", "range_start", "range_end"),
+  type = "within",
+  nomatch = NULL
+)[, .(chr, region_start, region_end, n_methods, methods,
+      gwas_pos = pos, p_score, rs)]
+
+# Summary: one row per candidate region, with aggregated GWAS info
+gwas_overlap_summary <- gwas_ol[
+  ,
+  .(n_gwas_snps   = .N,
+    min_p          = min(p_score),
+    top_snp        = rs[which.min(p_score)],
+    gwas_positions = paste(sort(unique(gwas_pos)), collapse = ",")),
+  by = .(chr, region_start, region_end, n_methods, methods)
+] |>
+  arrange(chr, region_start)
+
+cat("\nCandidate regions with ≥1 GWAS significant SNP within ±",
+    BUFFER / 1e3, "kb:\n")
+
+# Full SNP-level detail
+cat("\nAll GWAS significant SNPs overlapping candidate regions:\n")
+
+# Candidate regions with NO GWAS overlap
+cands_no_gwas <- candidate_regions |>
+  anti_join(
+    gwas_overlap_summary |> select(chr, region_start, region_end),
+    by = c("chr", "region_start", "region_end")
+  )
+cat("\nCandidate regions NOT overlapping any GWAS hit:", nrow(cands_no_gwas), "\n")
+if (nrow(cands_no_gwas) > 0) print(cands_no_gwas |> select(chr, region_start, region_end, n_methods, methods), n = 30)
+
+# Save overlap table
+fwrite(
+  gwas_overlap_summary,
+  file.path(reports_path, "selection", "candidate_regions_gwas_overlap.csv")
+)
+```
+
+```{r zoom_plots}
+# ============================================================
+# 9. ZOOMED MULTI-TRACK PLOTS
+#    For every candidate region that overlaps a GWAS significant SNP,
+#    produce a stacked figure with one track per evidence source:
+#      - GWAS -log10(p)  [always]
+#      - RAiSD mu        [if flagged]
+#      - Tajima's D      [if flagged]
+#      - Pi              [always, as context]
+#      - Pixy dxy        [if flagged]
+#    Yellow band = candidate region; blue band = local_pca hit.
+# ============================================================
+
+ZOOM_PAD <- 2000000   # bp padding either side of the candidate region
+
+POP_COLS <- c(uk = "#e63946", shetland = "#f4a261",
+              norway  = "#2a9d8f", spain    = "#6a0572")
+
+# Shared theme for all tracks (x-axis suppressed; restored on bottom panel)
+track_theme <- theme_classic() +
+  theme(
+    text            = element_text(family = "roboto_condensed", size = 11),
+    axis.title.x    = element_blank(),
+    axis.text.x     = element_blank(),
+    axis.ticks.x    = element_blank(),
+    panel.grid      = element_blank(),
+    legend.key.size = unit(0.4, "cm"),
+    legend.text     = element_text(size = 9)
+  )
+
+# Helpers -------------------------------------------------------
+add_highlight <- function(p, rstart, rend) {
+  p + annotate("rect",
+               xmin = rstart / 1e6, xmax = rend / 1e6,
+               ymin = -Inf,         ymax = Inf,
+               fill = "#f4d03f", alpha = 0.2)
+}
+
+# Main function -------------------------------------------------
+plot_candidate_region <- function(row) {
+  chr_r  <- row[["chr"]]
+  rstart <- as.numeric(row[["region_start"]])
+  rend   <- as.numeric(row[["region_end"]])
+  meths  <- strsplit(row[["methods"]], "\\|")[[1]]
+  zstart <- max(0, rstart - ZOOM_PAD)
+  zend   <- rend + ZOOM_PAD
+  xlims  <- c(zstart / 1e6, zend / 1e6)
+
+  title_str <- sprintf(
+    "%s: %.3f\u2013%.3f Mb  \u2502  %s",
+    chr_r, rstart / 1e6, rend / 1e6,
+    paste(meths, collapse = " | ")
+  )
+
+  # Local-PCA regions overlapping this window (blue annotation bands)
+  lpca_here <- lpca_raw |>
+    filter(chr == chr_r, region_end >= zstart, region_start <= zend)
+
+  shade_lpca <- function(p) {
+    if (nrow(lpca_here) == 0) return(p)
+    for (j in seq_len(nrow(lpca_here))) {
+      p <- p + annotate("rect",
+                        xmin = lpca_here$region_start[j] / 1e6,
+                        xmax = lpca_here$region_end[j]   / 1e6,
+                        ymin = -Inf, ymax = Inf,
+                        fill = "#3498db", alpha = 0.12)
+    }
+    p
+  }
+
+  panels <- list()
+
+  # -- 1. GWAS (always) ----------------------------------------
+  gwas_z <- gwas_raw[
+    chr == chr_r & pos >= zstart & pos <= zend & !is.na(p_score),
+    .(pos, mlogp = -log10(pmax(p_score, 1e-300)))
+  ]
+  p_gwas <- ggplot(gwas_z, aes(x = pos / 1e6, y = mlogp)) +
+    geom_point(size = 0.8, colour = "#5a798f", alpha = 0.6) +
+    geom_hline(yintercept = -log10(gwas_bonf),
+               linetype = "dashed", colour = "red", linewidth = 0.5) +
+    scale_x_continuous(limits = xlims, expand = c(0, 0)) +
+    labs(y = expression(-log[10](italic(p)[GWAS]))) +
+    track_theme
+  panels[["gwas"]] <- add_highlight(p_gwas, rstart, rend) |> shade_lpca()
+
+  # -- 2. SNP density (always) — diagnose GWAS deserts ----------
+  # Counts ALL tested variants in gwas_raw (before significance filtering)
+  # per 50kb bin. A hard drop to near-zero inside the yellow band signals a
+  # mappability/quality filter boundary (Pattern 1 artefact), NOT biology.
+  # Dense points approaching the Bonferroni line = genuine signal (Pattern 2).
+  snp_dens_z <- gwas_raw[
+    chr == chr_r & pos >= zstart & pos <= zend,
+    .(n_snps = .N),
+    by = .(bin = bin_pos(pos))
+  ][, mid := bin + BIN_SIZE / 2L]
+  if (nrow(snp_dens_z) > 0) {
+    p_dens <- ggplot(snp_dens_z, aes(x = mid / 1e6, y = n_snps)) +
+      geom_col(fill = "#5a798f", alpha = 0.65,
+               width = BIN_SIZE / 1e6 * 0.85) +
+      scale_x_continuous(limits = xlims, expand = c(0, 0)) +
+      labs(y = "SNPs /\n50 kb") +
+      track_theme
+    panels[["snp_density"]] <- add_highlight(p_dens, rstart, rend) |> shade_lpca()
+  }
+
+  # -- 3. RAiSD (if flagged) -----------------------------------
+  if ("raisd" %in% meths) {
+    raisd_z <- rbindlist(lapply(POPS, function(p) {
+      f <- file.path(reports_path, "raisd",
+                     paste0("RAiSD_Report.wm_", p, ".clean.tsv"))
+      if (!file.exists(f)) return(NULL)
+      dat_r <- fread(f, select = c(1L, 2L, 5L),
+                     col.names = c("chr", "position", "VAR"))[
+        chr == chr_r & position >= zstart & position <= zend
+      ][, pop := p]
+      # Remove SNP-desert positions
+      ld_bins_chr <- low_density_bins[chr == chr_r, bin]
+      if (length(ld_bins_chr) > 0)
+        dat_r <- dat_r[!bin_pos(position) %in% ld_bins_chr]
+      dat_r
+    }), fill = TRUE)
+    if (nrow(raisd_z) > 0) {
+      p_raisd <- ggplot(raisd_z,
+                        aes(x = position / 1e6, y = VAR, colour = pop)) +
+        geom_line(linewidth = 0.6, alpha = 0.85) +
+        scale_colour_manual(values = POP_COLS, name = NULL) +
+        scale_x_continuous(limits = xlims, expand = c(0, 0)) +
+        labs(y = expression(μ_VAR ~ (RAiSD))) +
+        track_theme
+      panels[["raisd"]] <- add_highlight(p_raisd, rstart, rend) |> shade_lpca()
+    }
+  }
+
+  # -- 3. Tajima's D (if flagged) ------------------------------
+  if ("tajimas_d" %in% meths) {
+    taj_z <- rbindlist(lapply(POPS, function(p) {
+      f <- file.path(reports_path, "tajimasD",
+                     paste0(p, "_tajimasD_50kb.Tajima.D"))
+      if (!file.exists(f)) return(NULL)
+      fread(f, header = TRUE)[
+        CHROM == chr_r & BIN_START >= zstart & BIN_START <= zend &
+          BIN_START >= CHR_START_TRIM & N_SNPS >= MIN_BIN_SNPS &
+          !bin_pos(BIN_START) %in% low_density_bins[chr == chr_r, bin]
+      ][, `:=`(pop = p, mid = BIN_START + 25000L)]
+    }), fill = TRUE)
+    if (nrow(taj_z) > 0) {
+      p_taj <- ggplot(taj_z, aes(x = mid / 1e6, y = TajimaD, colour = pop)) +
+        geom_line(linewidth = 0.6, alpha = 0.85) +
+        geom_hline(yintercept = c(-2, 2),
+                   linetype = "dashed", colour = "grey60", linewidth = 0.35) +
+        scale_colour_manual(values = POP_COLS, name = NULL) +
+        scale_x_continuous(limits = xlims, expand = c(0, 0)) +
+        labs(y = "Tajima's D") +
+        track_theme
+      panels[["tajimas_d"]] <- add_highlight(p_taj, rstart, rend) |> shade_lpca()
+    }
+  }
+
+  # -- 4. Pi (always, as diversity context) --------------------
+  pi_z <- rbindlist(lapply(POPS, function(p) {
+    f <- file.path(reports_path, "pi",
+                   paste0(p, "_pi_50kb.windowed.pi"))
+    if (!file.exists(f)) return(NULL)
+    fread(f, header = TRUE)[
+      CHROM == chr_r & BIN_START >= zstart & BIN_START <= zend &
+        BIN_START >= CHR_START_TRIM & N_VARIANTS >= MIN_BIN_SNPS &
+        !bin_pos(BIN_START) %in% low_density_bins[chr == chr_r, bin]
+    ][, `:=`(pop = p, mid = (BIN_START + BIN_END) / 2)]
+  }), fill = TRUE)
+  if (nrow(pi_z) > 0) {
+    p_pi <- ggplot(pi_z, aes(x = mid / 1e6, y = PI, colour = pop)) +
+      geom_line(linewidth = 0.6, alpha = 0.85) +
+      scale_colour_manual(values = POP_COLS, name = NULL) +
+      scale_x_continuous(limits = xlims, expand = c(0, 0)) +
+      labs(y = expression(pi)) +
+      track_theme
+    panels[["pi"]] <- add_highlight(p_pi, rstart, rend) |> shade_lpca()
+  }
+
+  # -- 5. Pixy dxy (if flagged) --------------------------------
+  if ("pixy_dxy" %in% meths) {
+    pixy_z <- pixy_raw[
+      chr == chr_r &
+        window_pos_1 >= zstart & window_pos_1 <= zend &
+        window_pos_1 >= CHR_START_TRIM &
+        no_sites >= MIN_BIN_SNPS &
+        !bin_pos(window_pos_1) %in% low_density_bins[chr == chr_r, bin]
+    ][, `:=`(pair = paste(pop1, "vs", pop2),
+             mid  = (window_pos_1 + window_pos_2) / 2)]
+    if (nrow(pixy_z) > 0) {
+      p_pixy <- ggplot(pixy_z, aes(x = mid / 1e6, y = avg_dxy, colour = pair)) +
+        geom_line(linewidth = 0.5, alpha = 0.8) +
+        scale_colour_brewer(palette = "Dark2", name = NULL) +
+        scale_x_continuous(limits = xlims, expand = c(0, 0)) +
+        labs(y = expression(d[xy])) +
+        track_theme
+      panels[["pixy_dxy"]] <- add_highlight(p_pixy, rstart, rend) |> shade_lpca()
+    }
+  }
+
+  # -- 6. nSL (if flagged) -------------------------------------
+  if ("nsl" %in% meths) {
+    nsl_z <- rbindlist(lapply(POPS, function(p) {
+      f <- file.path(reports_path, "selection", p, "nsl", chr_r,
+                     paste0(p, "_", chr_r, "_nsl.nsl.out"))
+      if (!file.exists(f)) return(NULL)
+      dat_n <- fread(f, select = c("pos", "nsl"))[
+        pos >= zstart & pos <= zend & !is.na(nsl)
+      ][, pop := p]
+      ld_bins_chr <- low_density_bins[chr == chr_r, bin]
+      if (length(ld_bins_chr) > 0)
+        dat_n <- dat_n[!bin_pos(pos) %in% ld_bins_chr]
+      dat_n
+    }), fill = TRUE)
+    if (nrow(nsl_z) > 0) {
+      p_nsl <- ggplot(nsl_z, aes(x = pos / 1e6, y = nsl, colour = pop)) +
+        geom_point(size = 0.4, alpha = 0.5) +
+        geom_hline(yintercept = c(-2, 2),
+                   linetype = "dashed", colour = "grey60", linewidth = 0.35) +
+        scale_colour_manual(values = POP_COLS, name = NULL) +
+        scale_x_continuous(limits = xlims, expand = c(0, 0)) +
+        labs(y = "nSL") +
+        track_theme
+      panels[["nsl"]] <- add_highlight(p_nsl, rstart, rend) |> shade_lpca()
+    }
+  }
+
+  # -- 7. iHS (if flagged) -------------------------------------
+  if ("ihs" %in% meths) {
+    ihs_z <- rbindlist(lapply(POPS, function(p) {
+      f <- file.path(reports_path, "selection", p, "ihs", chr_r,
+                     paste0(p, "_", chr_r, "_ihs.ihs.out"))
+      if (!file.exists(f)) return(NULL)
+      dat_i <- fread(f, select = c("pos", "ihs"))[
+        pos >= zstart & pos <= zend & !is.na(ihs)
+      ][, pop := p]
+      ld_bins_chr <- low_density_bins[chr == chr_r, bin]
+      if (length(ld_bins_chr) > 0)
+        dat_i <- dat_i[!bin_pos(pos) %in% ld_bins_chr]
+      dat_i
+    }), fill = TRUE)
+    if (nrow(ihs_z) > 0) {
+      p_ihs <- ggplot(ihs_z, aes(x = pos / 1e6, y = ihs, colour = pop)) +
+        geom_point(size = 0.4, alpha = 0.5) +
+        geom_hline(yintercept = c(-2, 2),
+                   linetype = "dashed", colour = "grey60", linewidth = 0.35) +
+        scale_colour_manual(values = POP_COLS, name = NULL) +
+        scale_x_continuous(limits = xlims, expand = c(0, 0)) +
+        labs(y = "iHS") +
+        track_theme
+      panels[["ihs"]] <- add_highlight(p_ihs, rstart, rend) |> shade_lpca()
+    }
+  }
+
+  # -- 8. XP-EHH (if flagged) ----------------------------------
+  if ("xpehh" %in% meths) {
+    xpehh_z <- rbindlist(lapply(XPEHH_PAIRS, function(pair_name) {
+      f <- file.path(reports_path, "selection", "xpehh", pair_name, chr_r,
+                     paste0(pair_name, "_", chr_r, "_xpehh.xpehh.out.norm"))
+      if (!file.exists(f)) return(NULL)
+      dat_xp <- fread(f, select = c("pos", "norm_xpehh"))[
+        pos >= zstart & pos <= zend & !is.na(norm_xpehh)
+      ][, pair := pair_name]
+      ld_bins_chr <- low_density_bins[chr == chr_r, bin]
+      if (length(ld_bins_chr) > 0)
+        dat_xp <- dat_xp[!bin_pos(pos) %in% ld_bins_chr]
+      dat_xp
+    }), fill = TRUE)
+    if (nrow(xpehh_z) > 0) {
+      p_xpehh <- ggplot(xpehh_z, aes(x = pos / 1e6, y = norm_xpehh, colour = pair)) +
+        geom_point(size = 0.4, alpha = 0.5) +
+        geom_hline(yintercept = 0,
+                   linetype = "solid", colour = "grey40", linewidth = 0.3) +
+        scale_colour_brewer(palette = "Set2", name = NULL) +
+        scale_x_continuous(limits = xlims, expand = c(0, 0)) +
+        labs(y = "XP-EHH\n(norm)") +
+        track_theme
+      panels[["xpehh"]] <- add_highlight(p_xpehh, rstart, rend) |> shade_lpca()
+    }
+  }
+
+  # -- Restore x-axis on the bottom panel ----------------------
+  n <- length(panels)
+  panels[[n]] <- panels[[n]] +
+    theme(
+      axis.title.x = element_text(),
+      axis.text.x  = element_text(),
+      axis.ticks.x = element_line()
+    ) +
+    labs(x = paste0(gsub("chr", "Chr ", chr_r), " position (Mb)"))
+
+  # -- Assemble with patchwork ---------------------------------
+  wrap_plots(panels, ncol = 1, heights = rep(1, n)) +
+    plot_annotation(
+      title = title_str,
+      theme = theme(
+        plot.title = element_text(
+          family = "roboto_condensed", face = "bold",
+          size = 12, hjust = 0.5
+        )
+      )
+    )
+}
+
+# -- Save individual PDFs + combined file ---------------------
+zoom_dir <- file.path(figures_path, "zoom")
+if (!dir.exists(zoom_dir)) dir.create(zoom_dir, recursive = TRUE)
+
+if (nrow(gwas_overlap_summary) == 0) {
+  message("No candidate regions overlap GWAS significant SNPs \u2014 nothing to plot.")
+} else {
+  for (i in seq_len(nrow(gwas_overlap_summary))) {
+    row      <- as.list(gwas_overlap_summary[i])
+    meths_v  <- strsplit(row[["methods"]], "\\|")[[1]]
+    n_panels <- sum(c(
+      TRUE,                         # gwas always
+      TRUE,                         # snp density always
+      "raisd"     %in% meths_v,
+      "tajimas_d" %in% meths_v,
+      TRUE,                         # pi always
+      "pixy_dxy"  %in% meths_v,
+      "nsl"       %in% meths_v,
+      "ihs"       %in% meths_v,
+      "xpehh"     %in% meths_v
+    ))
+    p <- plot_candidate_region(row)
+    fname <- sprintf("%s_%d_%d_zoom.pdf",
+                     row[["chr"]], row[["region_start"]], row[["region_end"]])
+    ggsave(file.path(zoom_dir, fname), p,
+           width = 10, height = n_panels * 2.5 + 1.5)
+  }
+
+  # Multi-page combined PDF
+  cairo_pdf(
+    file.path(figures_path, "candidate_regions_zoom_all.pdf"),
+    width = 10, height = 12, onefile = TRUE
+  )
+  for (i in seq_len(nrow(gwas_overlap_summary))) {
+    print(plot_candidate_region(as.list(gwas_overlap_summary[i])))
+  }
+  dev.off()
+
+  cat(sprintf(
+    "Saved %d zoomed region plots.\n  Individual: %s/\n  Combined:   candidate_regions_zoom_all.pdf\n",
+    nrow(gwas_overlap_summary), zoom_dir
+  ))
+}
+```
+
+```{r chr10_top_region}
+# ============================================================
+# FOCUSED PLOT — top GWAS SNP on chr10
+#   Zoom: ± 1 Mb around the top GWAS SNP
+#   Low-density bins (< 80 SNPs/50kb) removed & gaps collapsed
+# ============================================================
+
+chr_r10    <- "chr10"
+focal_pad  <- 1000000L
+MIN_DENSITY <- 80L   # SNPs per 50kb bin threshold
+
+# --- 1) Find the top GWAS SNP on chr10 ----------------------
+chr10_top <- gwas_raw[
+  chr == chr_r10 & !is.na(p_score)
+][order(p_score)][1]
+
+if (nrow(chr10_top) == 0) stop("No GWAS SNPs found on chr10.")
+
+focal_pos   <- as.numeric(chr10_top$pos)
+focal_start <- max(0L, focal_pos - focal_pad)
+focal_end   <- focal_pos + focal_pad
+
+cat(sprintf(
+  "chr10 top GWAS SNP: %s:%d  (p = %s)\n",
+  chr_r10, focal_pos,
+  formatC(chr10_top$p_score, format = "e", digits = 2)
+))
+
+# --- 2) Build density map & identify kept bins ---------------
+snp_density_full <- gwas_raw[
+  chr == chr_r10 & pos >= focal_start & pos <= focal_end,
+  .(n_snps = .N),
+  by = .(bin = bin_pos(pos))
+][order(bin)]
+
+kept_bins <- snp_density_full[n_snps >= MIN_DENSITY, bin]
+
+# For every position, which bin does it fall in?
+in_kept_bin <- function(pos_vec) {
+  bin_pos(pos_vec) %in% kept_bins
+}
+
+# --- 3) Build a collapsed x-axis ----------------------------
+# Each kept bin gets a sequential index; we map physical pos → index space
+# Bin midpoints in order
+kept_bin_mids <- kept_bins + BIN_SIZE / 2L
+
+# Map a physical position vector to collapsed x coordinates
+# (linear interpolation within each bin, bins laid end-to-end)
+phys_to_collapsed <- function(pos_vec) {
+  b   <- bin_pos(pos_vec)                     # which bin
+  off <- (pos_vec - b) / BIN_SIZE             # 0–1 offset within bin
+  idx <- match(b, kept_bins)                  # sequential bin index (1-based)
+  (idx - 1L + off)                            # collapsed coordinate
+}
+
+n_kept <- length(kept_bins)
+
+# Build x-axis break labels (physical Mb) at ~10 evenly-spaced kept bins
+label_idx  <- round(seq(1, n_kept, length.out = min(10L, n_kept)))
+label_x    <- label_idx - 0.5                # collapsed coord at bin centre
+label_text <- sprintf("%.2f", kept_bin_mids[label_idx] / 1e6)
+
+collapsed_scale <- list(
+  scale_x_continuous(
+    breaks = label_x,
+    labels = label_text,
+    expand = c(0.01, 0)
+  ),
+  coord_cartesian(xlim = c(0, n_kept))
+)
+
+# Collapsed x for the focal SNP (for highlight)
+focal_collapsed <- phys_to_collapsed(focal_pos)
+
+# --- 4) Shading helpers (collapsed coords) -------------------
+lpca_focal <- lpca_raw |>
+  dplyr::filter(
+    chr == chr_r10,
+    region_end   >= focal_start,
+    region_start <= focal_end
+  )
+
+shade_lpca_focal <- function(p) {
+  if (nrow(lpca_focal) == 0) return(p)
+  for (j in seq_len(nrow(lpca_focal))) {
+    # find kept bins that overlap this LPCA region
+    overlap_bins <- kept_bins[
+      kept_bins + BIN_SIZE >= lpca_focal$region_start[j] &
+      kept_bins             <= lpca_focal$region_end[j]
+    ]
+    if (length(overlap_bins) == 0) next
+    idx_start <- match(min(overlap_bins), kept_bins) - 1L
+    idx_end   <- match(max(overlap_bins), kept_bins)
+    p <- p + annotate(
+      "rect",
+      xmin = idx_start, xmax = idx_end,
+      ymin = -Inf, ymax = Inf,
+      fill = "#3498db", alpha = 0.12
+    )
+  }
+  p
+}
+
+decorate <- function(p) {
+  shade_lpca_focal(p)
+}
+
+# --- 5) Build panels -----------------------------------------
+p10 <- list()
+
+# 5.1 GWAS
+gwas_10 <- gwas_raw[
+  chr == chr_r10 & pos >= focal_start & pos <= focal_end & !is.na(p_score)
+][in_kept_bin(pos)][
+  , .(cx = phys_to_collapsed(pos), mlogp = -log10(pmax(p_score, 1e-300)))
+]
+
+p10[["gwas"]] <- (
+  ggplot(gwas_10, aes(x = cx, y = mlogp)) +
+    geom_point(size = 1, colour = "#5a798f", alpha = 0.7) +
+    geom_hline(yintercept = -log10(gwas_bonf),
+               linetype = "dashed", colour = "red", linewidth = 0.5) +
+    collapsed_scale +
+    labs(y = expression(-log[10](italic(p)[GWAS]))) +
+    track_theme
+) |> decorate()
+
+# 5.2 SNP density (only kept bins, no gaps)
+snp_10 <- snp_density_full[bin %in% kept_bins][
+  , cx := phys_to_collapsed(bin + BIN_SIZE / 2L)
+]
+
+p10[["snp_density"]] <- (
+  ggplot(snp_10, aes(x = cx, y = n_snps)) +
+    geom_col(fill = "#5a798f", alpha = 0.65, width = 0.85) +
+    geom_hline(yintercept = MIN_DENSITY,
+               linetype = "dotted", colour = "red", linewidth = 0.4) +
+    collapsed_scale +
+    labs(y = "SNPs /\n50 kb") +
+    track_theme
+) |> decorate()
+
+# 5.3 RAiSD
+raisd_10 <- rbindlist(lapply(POPS, function(p) {
+  f <- file.path(reports_path, "raisd",
+                 paste0("RAiSD_Report.wm_", p, ".clean.tsv"))
+  if (!file.exists(f)) return(NULL)
+  dat <- fread(f, select = c(1L, 2L, 5L),
+               col.names = c("chr", "position", "VAR"))[
+    chr == chr_r10 & position >= focal_start & position <= focal_end
+  ][in_kept_bin(position)][, `:=`(pop = p, cx = phys_to_collapsed(position))]
+  dat
+}), fill = TRUE)
+
+if (nrow(raisd_10) > 0) {
+  p10[["raisd"]] <- (
+    ggplot(raisd_10, aes(x = cx, y = VAR, colour = pop)) +
+      geom_line(linewidth = 0.7, alpha = 0.85) +
+      scale_colour_manual(values = POP_COLS, name = NULL) +
+      collapsed_scale +
+      labs(y = expression(mu[VAR] ~ (RAiSD))) +
+      track_theme
+  ) |> decorate()
+}
+
+# 5.4 Tajima's D
+taj_10 <- rbindlist(lapply(POPS, function(p) {
+  f <- file.path(reports_path, "tajimasD",
+                 paste0(p, "_tajimasD_50kb.Tajima.D"))
+  if (!file.exists(f)) return(NULL)
+  dat <- fread(f, header = TRUE)[
+    CHROM == chr_r10 & BIN_START >= focal_start & BIN_START <= focal_end &
+    BIN_START >= CHR_START_TRIM & N_SNPS >= MIN_BIN_SNPS
+  ][in_kept_bin(BIN_START)][
+    , `:=`(pop = p, cx = phys_to_collapsed(BIN_START + 25000L))
+  ]
+  dat
+}), fill = TRUE)
+
+if (nrow(taj_10) > 0) {
+  p10[["tajimas_d"]] <- (
+    ggplot(taj_10, aes(x = cx, y = TajimaD, colour = pop)) +
+      geom_line(linewidth = 0.7, alpha = 0.85) +
+      geom_hline(yintercept = c(-2, 2),
+                 linetype = "dashed", colour = "grey60", linewidth = 0.35) +
+      scale_colour_manual(values = POP_COLS, name = NULL) +
+      collapsed_scale +
+      labs(y = "Tajima's D") +
+      track_theme
+  ) |> decorate()
+}
+
+# 5.5 Pi
+pi_10 <- rbindlist(lapply(POPS, function(p) {
+  f <- file.path(reports_path, "pi",
+                 paste0(p, "_pi_50kb.windowed.pi"))
+  if (!file.exists(f)) return(NULL)
+  dat <- fread(f, header = TRUE)[
+    CHROM == chr_r10 & BIN_START >= focal_start & BIN_START <= focal_end &
+    BIN_START >= CHR_START_TRIM & N_VARIANTS >= MIN_BIN_SNPS
+  ][in_kept_bin(BIN_START)][
+    , `:=`(pop = p, cx = phys_to_collapsed((BIN_START + BIN_END) / 2))
+  ]
+  dat
+}), fill = TRUE)
+
+if (nrow(pi_10) > 0) {
+  p10[["pi"]] <- (
+    ggplot(pi_10, aes(x = cx, y = PI, colour = pop)) +
+      geom_line(linewidth = 0.7, alpha = 0.85) +
+      scale_colour_manual(values = POP_COLS, name = NULL) +
+      collapsed_scale +
+      labs(y = expression(pi)) +
+      track_theme
+  ) |> decorate()
+}
+
+# 5.6 Pixy dxy
+pixy_10 <- pixy_raw[
+  chr == chr_r10 & window_pos_1 >= focal_start & window_pos_1 <= focal_end &
+  window_pos_1 >= CHR_START_TRIM & no_sites >= MIN_BIN_SNPS
+][in_kept_bin(window_pos_1)][
+  , `:=`(
+    pair = paste(pop1, "vs", pop2),
+    cx   = phys_to_collapsed((window_pos_1 + window_pos_2) / 2)
+  )
+]
+
+if (nrow(pixy_10) > 0) {
+  p10[["pixy_dxy"]] <- (
+    ggplot(pixy_10, aes(x = cx, y = avg_dxy, colour = pair)) +
+      geom_line(linewidth = 0.6, alpha = 0.8) +
+      scale_colour_brewer(palette = "Dark2", name = NULL) +
+      collapsed_scale +
+      labs(y = expression(d[xy])) +
+      track_theme
+  ) |> decorate()
+}
+
+# 5.7 nSL
+nsl_10 <- rbindlist(lapply(POPS, function(p) {
+  f <- file.path(reports_path, "selection", p, "nsl", chr_r10,
+                 paste0(p, "_", chr_r10, "_nsl.nsl.out"))
+  if (!file.exists(f)) return(NULL)
+  dat <- fread(f, select = c("pos", "nsl"))[
+    pos >= focal_start & pos <= focal_end & !is.na(nsl)
+  ][in_kept_bin(pos)][, `:=`(pop = p, cx = phys_to_collapsed(pos))]
+  dat
+}), fill = TRUE)
+
+if (nrow(nsl_10) > 0) {
+  p10[["nsl"]] <- (
+    ggplot(nsl_10, aes(x = cx, y = nsl, colour = pop)) +
+      geom_point(size = 0.5, alpha = 0.5) +
+      geom_hline(yintercept = c(-2, 2),
+                 linetype = "dashed", colour = "grey60", linewidth = 0.35) +
+      scale_colour_manual(values = POP_COLS, name = NULL) +
+      collapsed_scale +
+      labs(y = "nSL") +
+      track_theme
+  ) |> decorate()
+}
+
+# 5.8 iHS
+ihs_10 <- rbindlist(lapply(POPS, function(p) {
+  f <- file.path(reports_path, "selection", p, "ihs", chr_r10,
+                 paste0(p, "_", chr_r10, "_ihs.ihs.out"))
+  if (!file.exists(f)) return(NULL)
+  dat <- fread(f, select = c("pos", "ihs"))[
+    pos >= focal_start & pos <= focal_end & !is.na(ihs)
+  ][in_kept_bin(pos)][, `:=`(pop = p, cx = phys_to_collapsed(pos))]
+  dat
+}), fill = TRUE)
+
+if (nrow(ihs_10) > 0) {
+  p10[["ihs"]] <- (
+    ggplot(ihs_10, aes(x = cx, y = ihs, colour = pop)) +
+      geom_point(size = 0.5, alpha = 0.5) +
+      geom_hline(yintercept = c(-2, 2),
+                 linetype = "dashed", colour = "grey60", linewidth = 0.35) +
+      scale_colour_manual(values = POP_COLS, name = NULL) +
+      collapsed_scale +
+      labs(y = "iHS") +
+      track_theme
+  ) |> decorate()
+}
+
+# 5.9 XP-EHH
+xpehh_10 <- rbindlist(lapply(XPEHH_PAIRS, function(pair_name) {
+  f <- file.path(reports_path, "selection", "xpehh", pair_name, chr_r10,
+                 paste0(pair_name, "_", chr_r10, "_xpehh.xpehh.out.norm"))
+  if (!file.exists(f)) return(NULL)
+  dat <- fread(f, select = c("pos", "norm_xpehh"))[
+    pos >= focal_start & pos <= focal_end & !is.na(norm_xpehh)
+  ][in_kept_bin(pos)][, `:=`(pair = pair_name, cx = phys_to_collapsed(pos))]
+  dat
+}), fill = TRUE)
+
+if (nrow(xpehh_10) > 0) {
+  p10[["xpehh"]] <- (
+    ggplot(xpehh_10, aes(x = cx, y = norm_xpehh, colour = pair)) +
+      geom_point(size = 0.5, alpha = 0.5) +
+      geom_hline(yintercept = 0,
+                 linetype = "solid", colour = "grey40", linewidth = 0.3) +
+      scale_colour_brewer(palette = "Set2", name = NULL) +
+      collapsed_scale +
+      labs(y = "XP-EHH\n(norm)") +
+      track_theme
+  ) |> decorate()
+}
+
+# --- 6) Restore x-axis on bottom panel ----------------------
+if (length(p10) == 0) stop("No tracks were created for the chr10 focal region.")
+
+n10      <- length(p10)
+p10[[n10]] <- p10[[n10]] +
+  theme(
+    axis.title.x = element_text(),
+    axis.text.x  = element_text(),
+    axis.ticks.x = element_line()
+  ) +
+  labs(x = "Chr 10 position (Mb)  [low-density bins removed]")
+
+chr10_title <- sprintf(
+  "Chr10 top GWAS SNP: %.3f Mb  |  ±1 Mb zoom  |  SNP density ≥ %d /50kb  |  %s",
+  focal_pos / 1e6, MIN_DENSITY,
+  paste(names(p10), collapse = " | ")
+)
+
+p_chr10_all <- wrap_plots(p10, ncol = 1, heights = rep(1, n10)) +
+  plot_annotation(
+    title = chr10_title,
+    theme = theme(
+      plot.title = element_text(
+        family = "roboto_condensed", face = "bold", size = 11, hjust = 0.5
+      )
+    )
+  )
+
+# --- 7) Print and save --------------------------------------
+p_chr10_all
+
+ggsave(
+  file.path(figures_path, "chr10_top_gwas_snp_all_methods.png"),
+  p_chr10_all,
+  width  = 6,
+  height = n10 * 2.5 + 1.5
+)
+
+cat(sprintf(
+  "Saved chr10 focal plot with %d tracks, %d/%d bins kept (≥%d SNPs/50kb)\n",
+  n10, length(kept_bins), nrow(snp_density_full), MIN_DENSITY
+))
+```
+
+```{r per_population}
+# ============================================================
+# 9. PER-POPULATION BREAKDOWN
+#    For each population: how many of the within-pop methods
+#    (TajD + RAiSD) flag the region, and is it also a local_pca hit?
+# ============================================================
+
+# Expand pop-specific and local_pca bins separately
+pop_expanded   <- expand_buffer(rbindlist(list(taj_bins, raisd_bins, nsl_bins, ihs_bins), fill = TRUE))
+lpca_expanded  <- expand_buffer(lpca_bins) |> distinct(chr, bin) |> mutate(local_pca = TRUE)
+pixy_expanded  <- expand_buffer(rbindlist(list(pixy_bins, xpehh_bins), fill = TRUE))
+gwas_expanded  <- expand_buffer(gwas_bins) |> distinct(chr, bin) |> mutate(gwas_hit  = TRUE)
+
+per_pop_candidates <- lapply(POPS, function(p) {
+  # Within-pop score (TajD + RAiSD + nSL + iHS)
+  within_pop <- pop_expanded[pop == p,
+    .(n_within_methods = uniqueN(source),
+      within_methods   = paste(sort(unique(source)), collapse = "|")),
+    by = .(chr, bin)
+  ]
+
+  # pixy + xpehh pairs involving this population
+  pixy_pop <- pixy_expanded[grepl(p, pop),
+    .(pixy_hit = TRUE),
+    by = .(chr, bin)
+  ] |> distinct(chr, bin, pixy_hit)
+
+  within_pop |>
+    left_join(lpca_expanded, by = c("chr", "bin")) |>
+    left_join(pixy_pop,      by = c("chr", "bin")) |>
+    left_join(gwas_expanded, by = c("chr", "bin")) |>
+    mutate(
+      local_pca     = coalesce(local_pca, FALSE),
+      pixy_hit      = coalesce(pixy_hit,  FALSE),
+      gwas_hit      = coalesce(gwas_hit,  FALSE),
+      total_methods = n_within_methods + local_pca + pixy_hit + gwas_hit,
+      pop = p
+    ) |>
+    filter(total_methods >= MIN_METHODS)
+}) |>
+  bind_rows() |>
+  as.data.table()
+
+# Merge into regions per population
+per_pop_regions <- per_pop_candidates |>
+  group_by(pop, chr) |>
+  arrange(pop, chr, bin) |>
+  mutate(
+    gap      = bin - lag(bin, default = first(bin)),
+    new_blk  = gap > BIN_SIZE | row_number() == 1L,
+    block_id = cumsum(new_blk)
+  ) |>
+  group_by(pop, chr, block_id) |>
+  summarise(
+    region_start      = min(bin),
+    region_end        = max(bin) + BIN_SIZE - 1L,
+    region_len_kb     = (max(bin) - min(bin) + BIN_SIZE) / 1e3,
+    n_support_bins    = n(),
+    max_total_methods = max(total_methods),
+    has_local_pca     = any(local_pca),
+    has_pixy          = any(pixy_hit),
+    has_gwas          = any(gwas_hit),
+    within_methods    = paste(
+      sort(unique(unlist(strsplit(within_methods, "\\|")))), collapse = "|"
+    ),
+    .groups = "drop"
+  ) |>
+  select(-block_id) |>
+  arrange(pop, desc(max_total_methods), desc(n_support_bins))
+
+cat("\nPer-population candidate regions:\n")
+per_pop_regions |> print(n = 50)
+
+fwrite(
+  per_pop_regions,
+  file.path(reports_path, "selection", "candidate_regions_per_population.csv")
+)
+```
+
+```{r visualise_global}
+# ============================================================
+# 10. VISUALISATION — genome-wide overview of candidate regions
+# ============================================================
+
+# Chromosome lengths from RAiSD (use as proxy for genome layout)
+chr_lengths <- rbindlist(lapply(POPS[1], function(p) {
+  f <- file.path(reports_path, "raisd",
+                 paste0("RAiSD_Report.wm_", p, ".clean.tsv"))
+  fread(f, select = c(1L, 2L, 5L),
+        col.names = c("chr", "position", "VAR"))[
+    !grepl("scaffold|mito|unplaced", chr),
+    .(chr_len = max(position)),
+    by = chr
+  ]
+}))[chr %in% CHROMS] |>
+  distinct(chr, .keep_all = TRUE) |>
+  mutate(chr_num = as.integer(str_extract(chr, "\\d+"))) |>
+  arrange(chr_num, chr) |>
+  mutate(
+    chr      = factor(chr, levels = chr),
+    offset   = lag(cumsum(as.numeric(chr_len) + 1e6), default = 0),
+    center   = offset + chr_len / 2
+  )
+
+# Add genome-wide coordinates to candidate regions
+candidates_plot <- candidate_regions |>
+  mutate(
+    chr      = factor(chr, levels = levels(chr_lengths$chr)),
+    has_gwas = grepl("gwas", methods)
+  ) |>
+  left_join(chr_lengths |> select(chr, offset), by = "chr") |>
+  mutate(
+    gstart = region_start + offset,
+    gend   = region_end   + offset,
+    gmid   = (gstart + gend) / 2
+  )
+
+ggplot(candidates_plot) +
+  geom_segment(
+    aes(x = gstart, xend = gend,
+        y = n_methods, yend = n_methods,
+        colour = factor(n_methods)),
+    linewidth = 3, alpha = 0.8
+  ) +
+  # Star marker above GWAS-supported regions
+  geom_point(
+    data = candidates_plot |> filter(has_gwas),
+    aes(x = gmid, y = n_methods + 0.4),
+    shape = 8, size = 2.5, colour = "#2d3436", stroke = 0.8
+  ) +
+  geom_text(
+    aes(x = gmid, y = n_methods + 0.15,
+        label = paste0(chr, ":", round(region_start / 1e6, 1), "Mb")),
+    size = 2.5, angle = 45, hjust = 0, family = "roboto_condensed"
+  ) +
+  scale_x_continuous(
+    breaks = chr_lengths$center,
+    labels = gsub("chr", "", chr_lengths$chr),
+    expand = c(0.01, 0.01)
+  ) +
+  scale_y_continuous(breaks = 1:5, limits = c(0.5, 6)) +
+  scale_colour_manual(
+    values = c("2" = "#aec6cf", "3" = "#f4a261", "4" = "#e63946", "5" = "#6a0572"),
+    name   = "Methods\nsupporting"
+  ) +
+  labs(
+    title    = "Candidate regions for selection — multi-method support",
+    subtitle = paste0("Buffer: \u00b1", BUFFER / 1e3, " kb | Min methods: ", MIN_METHODS,
+                      " | SNP deserts (<", MIN_BIN_SNPS, " SNPs/50kb) removed",
+                      " | \u2605 = GWAS support"),
+    x        = "Chromosome",
+    y        = "Number of methods"
+  ) +
+  theme_classic() +
+  theme(
+    panel.grid       = element_blank(),
+    axis.line        = element_line(color = "black"),
+    text             = element_text(family = "roboto_condensed", size = 14),
+    legend.position  = "right",
+    plot.title       = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle    = element_text(hjust = 0.5)
+  )
+
+ggsave(
+  file.path(figures_path, "candidate_regions_multimethod.pdf"),
+  width = 18, height = 5
+)
+```
+
+```{r visualise_per_pop}
+# Per-population dot plot: chr × method support, faceted by population
+per_pop_plot <- per_pop_regions |>
+  mutate(
+    chr      = factor(chr, levels = CHROMS),
+    has_gwas = has_gwas,
+    region   = paste0(gsub("chr", "", chr), ":",
+                      round(region_start / 1e6, 1), "\u2013",
+                      round(region_end   / 1e6, 1), " Mb")
+  )
+
+ggplot(per_pop_plot,
+       aes(x = region, y = pop,
+           size = n_support_bins, colour = factor(max_total_methods),
+           shape = has_gwas)) +
+  geom_point(alpha = 0.8) +
+  scale_shape_manual(
+    values = c("FALSE" = 16, "TRUE" = 8),
+    labels = c("No", "Yes"),
+    name   = "GWAS\nsupport"
+  ) +
+  scale_colour_manual(
+    values = c("1" = "#aec6cf", "2" = "#f4a261",
+               "3" = "#e63946", "4" = "#6a0572", "5" = "#2d3436"),
+    name   = "Total\nmethods"
+  ) +
+  scale_size_continuous(name = "Support\nbins", range = c(2, 8)) +
+  labs(
+    title = "Per-population candidate regions",
+    x     = "Region",
+    y     = NULL
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 9,
+                                    family = "roboto_condensed"),
+    text             = element_text(family = "roboto_condensed", size = 14),
+    plot.title       = element_text(face = "bold", hjust = 0.5),
+    panel.grid.major.x = element_line(colour = "grey90")
+  )
+
+ggsave(
+  file.path(figures_path, "candidate_regions_per_population.pdf"),
+  width = 14, height = 5
+)
+```
+
